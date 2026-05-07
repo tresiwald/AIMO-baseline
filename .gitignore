@@ -1,0 +1,15 @@
+.DS_Store
+__pycache__/
+*.pyc
+
+# Generated internals (large numpy arrays)
+data/internals/
+
+# Probe results
+results/
+
+# Cloned dependency — install via requirements.txt instructions
+holmes-evaluation/
+
+# Local memory
+memory/
