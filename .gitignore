@@ -4,6 +4,7 @@ __pycache__/
 
 # Generated internals (large numpy arrays)
 data/internals/
+data/eval_adoption_internals_*/
 
 # Probe results
 results/
@@ -13,3 +14,7 @@ holmes-evaluation/
 
 # Local memory
 memory/
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+notebooks/.ipynb_checkpoints/
