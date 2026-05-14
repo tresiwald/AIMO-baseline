@@ -1,15 +1,16 @@
 """
-Run eval-adoption probes in regression or classification mode.
+Run eval-adoption probes with automatic task-type inference from the target column.
 
 For each `permutation_type`, this script:
 1. runs a repeated K-fold evaluation across configurable seeds and folds,
 2. carves a validation split out of each fold's training pool for early stopping,
-3. trains one linear regression probe per transformer layer and control setup,
+3. trains one linear probe per transformer layer and control setup,
 4. optionally evaluates the trained probe on an additional OOD internals set,
 5. writes results via the Holmes CSV logger.
 
-The default regression target is `absolute_accuracy_decay`, but the script can
-also run classification probes, e.g. against `is_robust`.
+The default target is `absolute_accuracy_decay`, but the script can also run
+classification probes, e.g. against `is_robust`. Task type is inferred from
+the target column values.
 
 `permutation_type` is an eval-adoption perturbation label, not a Holmes control
 task. We therefore keep it in the probe name and dataset row identifiers, while
@@ -52,9 +53,7 @@ DEFAULT_SEEDS = [42, 43, 44, 45, 46]
 DEFAULT_NUM_FOLDS = 4
 DEFAULT_DEV_FRACTION = 0.20
 DEFAULT_TARGET_COL = "absolute_accuracy_decay"
-DEFAULT_TASK_TYPE = "regression"
-
-
+DEFAULT_NUM_WORKERS = os.cpu_count() or 1
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -103,18 +102,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--target-col",
         default=DEFAULT_TARGET_COL,
-        help="Metadata column used as the probe target, e.g. absolute_accuracy_decay or is_robust.",
-    )
-    parser.add_argument(
-        "--task-type",
-        default=DEFAULT_TASK_TYPE,
-        choices=["regression", "classification"],
-        help="Whether to run regression or classification probes.",
+        help="Metadata column used as the probe target, e.g. absolute_accuracy_decay or is_robust. Task type is inferred from its values.",
     )
     parser.add_argument(
         "--num-workers",
         type=int,
-        default=1,
+        default=DEFAULT_NUM_WORKERS,
         help="Number of parallel worker processes. Each worker handles one permutation/layer/seed/fold/control task.",
     )
     return parser.parse_args()
@@ -125,6 +118,28 @@ def parse_seeds(seed_arg: str) -> list[int]:
     if not seeds:
         raise ValueError("At least one seed must be provided")
     return seeds
+
+
+def infer_task_type(series: pd.Series) -> str:
+    non_null = series.dropna()
+    if non_null.empty:
+        raise ValueError("Target column contains no non-null values.")
+
+    if pd.api.types.is_bool_dtype(non_null):
+        return "classification"
+
+    if pd.api.types.is_integer_dtype(non_null):
+        unique_vals = set(non_null.astype(int).unique().tolist())
+        if unique_vals.issubset({0, 1}):
+            return "classification"
+
+    if pd.api.types.is_numeric_dtype(non_null):
+        unique_vals = set(pd.Series(non_null).astype(float).unique().tolist())
+        if unique_vals.issubset({0.0, 1.0}):
+            return "classification"
+        return "regression"
+
+    return "classification"
 
 
 def to_inputs(
@@ -570,7 +585,9 @@ def main() -> None:
                 f"Target column {args.target_col!r} not found in {Path(args.ood_internals_dir) / 'metadata.csv'}"
             )
 
-    if args.task_type == "regression":
+    task_type = infer_task_type(metadata[args.target_col])
+
+    if task_type == "regression":
         metadata[args.target_col] = metadata[args.target_col].astype(float)
         if ood_metadata is not None:
             ood_metadata[args.target_col] = ood_metadata[args.target_col].astype(float)
@@ -595,7 +612,7 @@ def main() -> None:
     print(
         f"Probing {n_layers} layers across "
         f"{metadata['permutation_type'].nunique()} permutation types, "
-        f"{len(CONTROL_TASKS)} control settings, target={args.target_col}, task={args.task_type}, "
+        f"{len(CONTROL_TASKS)} control settings, target={args.target_col}, task={task_type}, "
         f"{len(seeds)} seeds, {args.num_folds} folds, and {args.num_workers} worker(s)"
     )
 
@@ -603,7 +620,7 @@ def main() -> None:
     for permutation_type, subset in metadata.groupby("permutation_type", sort=True):
         subset = subset.reset_index(drop=True)
         row_ids = subset["row_id"].astype(int).tolist()
-        labels = subset[args.target_col].to_numpy(dtype=np.float32 if args.task_type == "regression" else np.int64)
+        labels = subset[args.target_col].to_numpy(dtype=np.float32 if task_type == "regression" else np.int64)
         subset_indices = subset["row_id"].to_numpy(dtype=int)
         ood_subset = None
         if ood_metadata is not None:
@@ -617,7 +634,7 @@ def main() -> None:
             )
             continue
 
-        if args.task_type == "classification":
+        if task_type == "classification":
             class_counts = subset[args.target_col].value_counts()
             if class_counts.min() < args.num_folds:
                 print(
@@ -632,12 +649,12 @@ def main() -> None:
             if ood_subset is not None and not ood_subset.empty:
                 ood_indices = ood_subset["row_id"].to_numpy(dtype=int)
                 ood_labels = ood_subset[args.target_col].to_numpy(
-                    dtype=np.float32 if args.task_type == "regression" else np.int64
+                    dtype=np.float32 if task_type == "regression" else np.int64
                 )
                 ood_row_ids = ood_subset["row_id"].astype(int).tolist()
 
             for seed in seeds:
-                if args.task_type == "classification":
+                if task_type == "classification":
                     splitter = StratifiedKFold(n_splits=args.num_folds, shuffle=True, random_state=seed)
                     split_iter = splitter.split(subset_indices, labels)
                 else:
@@ -658,7 +675,7 @@ def main() -> None:
                                 "control_task": control_task,
                                 "reduced_dim": args.reduced_dim,
                                 "target_col": args.target_col,
-                                "task_type": args.task_type,
+                                "task_type": task_type,
                                 "num_labels": num_labels,
                                 "seed": seed,
                                 "fold_idx": fold_idx,
