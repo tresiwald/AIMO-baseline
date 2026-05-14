@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Plot layer-wise probe performance for eval-adoption regression runs.
+Plot layer-wise probe performance for eval-adoption probe runs.
 
-The script aggregates `full test pearson` and `full test error` across all
-seed/fold runs per layer, then renders:
+The script aggregates task-appropriate full-test metrics across all seed/fold
+runs per layer, then renders:
 
-- one figure for Pearson correlation
-- one figure for test error
+- regression: Pearson correlation and test error
+- classification: accuracy and macro F1
 
 Each figure is arranged as:
 - rows: perturbation types
@@ -45,9 +45,13 @@ CONTROL_LABELS = {
 }
 DEFAULT_CONTROLS = ["NONE", "RANDOMIZATION"]
 REDUCTION_ORDER = ["full", "pca10", "pca50"]
-METRICS = [
+REGRESSION_METRICS = [
     ("full test pearson", "Pearson correlation", "pearson"),
     ("full test error", "Test error", "error"),
+]
+CLASSIFICATION_METRICS = [
+    ("full test acc", "Accuracy", "acc"),
+    ("full test f1", "Macro F1", "f1"),
 ]
 
 
@@ -78,6 +82,12 @@ def parse_args() -> argparse.Namespace:
         "--target-prefix",
         default="absolute_accuracy_decay",
         help="Only include probe names whose target prefix matches this string.",
+    )
+    parser.add_argument(
+        "--metric-set",
+        default="auto",
+        choices=["auto", "regression", "classification"],
+        help="Metric family to plot. 'auto' infers from available full-test metric columns.",
     )
     return parser.parse_args()
 
@@ -145,7 +155,19 @@ def load_metrics(group_dirs: list[Path], controls: set[str], target_prefix: str)
             df = pd.read_csv(metrics_path)
             if df.empty:
                 continue
-            row = df[df["full test pearson"].notna() | df["full test error"].notna()]
+            regression_mask = pd.Series(False, index=df.index)
+            if "full test pearson" in df.columns:
+                regression_mask = regression_mask | df["full test pearson"].notna()
+            if "full test error" in df.columns:
+                regression_mask = regression_mask | df["full test error"].notna()
+
+            classification_mask = pd.Series(False, index=df.index)
+            if "full test acc" in df.columns:
+                classification_mask = classification_mask | df["full test acc"].notna()
+            if "full test f1" in df.columns:
+                classification_mask = classification_mask | df["full test f1"].notna()
+
+            row = df[regression_mask | classification_mask]
             metric_row = row.iloc[-1] if not row.empty else df.iloc[-1]
 
             rows.append(
@@ -153,6 +175,8 @@ def load_metrics(group_dirs: list[Path], controls: set[str], target_prefix: str)
                     **parsed,
                     "full test pearson": metric_row.get("full test pearson", np.nan),
                     "full test error": metric_row.get("full test error", np.nan),
+                    "full test acc": metric_row.get("full test acc", np.nan),
+                    "full test f1": metric_row.get("full test f1", np.nan),
                 }
             )
 
@@ -160,6 +184,28 @@ def load_metrics(group_dirs: list[Path], controls: set[str], target_prefix: str)
         raise ValueError("No matching metrics were found.")
 
     return pd.DataFrame(rows)
+
+
+def select_metrics(metrics_df: pd.DataFrame, metric_set: str) -> list[tuple[str, str, str]]:
+    if metric_set == "regression":
+        return REGRESSION_METRICS
+    if metric_set == "classification":
+        return CLASSIFICATION_METRICS
+
+    has_regression = any(
+        col in metrics_df.columns and metrics_df[col].notna().any()
+        for col, _, _ in REGRESSION_METRICS
+    )
+    has_classification = any(
+        col in metrics_df.columns and metrics_df[col].notna().any()
+        for col, _, _ in CLASSIFICATION_METRICS
+    )
+
+    if has_regression:
+        return REGRESSION_METRICS
+    if has_classification:
+        return CLASSIFICATION_METRICS
+    raise ValueError("No supported full-test metrics were found in the selected result groups.")
 
 
 def aggregate_metrics(metrics_df: pd.DataFrame, metric_col: str) -> pd.DataFrame:
@@ -237,8 +283,9 @@ def main() -> None:
         raise ValueError("No result-group directories found.")
 
     metrics_df = load_metrics(group_dirs, controls=controls, target_prefix=args.target_prefix)
+    selected_metrics = select_metrics(metrics_df, args.metric_set)
 
-    for metric_col, metric_label, slug in METRICS:
+    for metric_col, metric_label, slug in selected_metrics:
         agg_df = aggregate_metrics(metrics_df, metric_col)
         plot_metric(
             agg_df,
