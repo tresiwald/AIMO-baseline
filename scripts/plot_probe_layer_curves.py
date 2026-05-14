@@ -10,7 +10,9 @@ runs per layer, then renders:
 
 Each figure is arranged as:
 - rows: perturbation types
-- columns: reduction settings (`full`, `pca10`, `pca50`) when present
+- columns: either reduction settings (`full`, `pca10`, `pca50`) or hidden-state
+  origins (`input_last_token`, `last_thinking_token`, `output_last_token`,
+  `average_output`)
 
 Within each subplot:
 - blue line: `NONE`
@@ -45,6 +47,7 @@ CONTROL_LABELS = {
 }
 DEFAULT_CONTROLS = ["NONE", "RANDOMIZATION"]
 REDUCTION_ORDER = ["full", "pca10", "pca50"]
+ORIGIN_ORDER = ["input_last_token", "last_thinking_token", "output_last_token", "average_output"]
 REGRESSION_METRICS = [
     ("full test pearson", "Pearson correlation", "pearson"),
     ("full test error", "Test error", "error"),
@@ -89,6 +92,12 @@ def parse_args() -> argparse.Namespace:
         choices=["auto", "regression", "classification"],
         help="Metric family to plot. 'auto' infers from available full-test metric columns.",
     )
+    parser.add_argument(
+        "--column-mode",
+        default="reduction",
+        choices=["reduction", "origin"],
+        help="Which run dimension to place in subplot columns.",
+    )
     return parser.parse_args()
 
 
@@ -99,6 +108,14 @@ def classify_reduction(group_name: str) -> str:
     if "pca50" in lower:
         return "pca50"
     return "full"
+
+
+def classify_origin(group_name: str) -> str:
+    lower = group_name.lower()
+    for origin in ORIGIN_ORDER:
+        if origin in lower:
+            return origin
+    return "input_last_token"
 
 
 def autodetect_result_dirs(results_root: Path) -> list[Path]:
@@ -129,6 +146,7 @@ def parse_metrics_path(group_dir: Path, metrics_path: Path) -> dict | None:
     return {
         "group_name": group_dir.name,
         "reduction": classify_reduction(group_dir.name),
+        "origin": classify_origin(group_dir.name),
         "probe_name": probe_name,
         "target": match.group("target"),
         "perturbation_type": match.group("perturbation"),
@@ -208,10 +226,11 @@ def select_metrics(metrics_df: pd.DataFrame, metric_set: str) -> list[tuple[str,
     raise ValueError("No supported full-test metrics were found in the selected result groups.")
 
 
-def aggregate_metrics(metrics_df: pd.DataFrame, metric_col: str) -> pd.DataFrame:
+def aggregate_metrics(metrics_df: pd.DataFrame, metric_col: str, column_mode: str) -> pd.DataFrame:
     frame = metrics_df[metrics_df[metric_col].notna()].copy()
+    column_key = "origin" if column_mode == "origin" else "reduction"
     grouped = (
-        frame.groupby(["reduction", "perturbation_type", "control_task", "layer"], as_index=False)[metric_col]
+        frame.groupby([column_key, "perturbation_type", "control_task", "layer"], as_index=False)[metric_col]
         .agg(["mean", "std", "count"])
         .reset_index()
     )
@@ -220,12 +239,20 @@ def aggregate_metrics(metrics_df: pd.DataFrame, metric_col: str) -> pd.DataFrame
     return grouped
 
 
-def plot_metric(agg_df: pd.DataFrame, metric_label: str, output_path: Path, log_scale: bool = False) -> None:
+def plot_metric(
+    agg_df: pd.DataFrame,
+    metric_label: str,
+    output_path: Path,
+    column_mode: str,
+    log_scale: bool = False,
+) -> None:
     perturbations = sorted(agg_df["perturbation_type"].unique())
-    reductions = [r for r in REDUCTION_ORDER if r in set(agg_df["reduction"].unique())]
+    column_key = "origin" if column_mode == "origin" else "reduction"
+    ordered_values = ORIGIN_ORDER if column_mode == "origin" else REDUCTION_ORDER
+    column_values = [value for value in ordered_values if value in set(agg_df[column_key].unique())]
 
     n_rows = len(perturbations)
-    n_cols = len(reductions)
+    n_cols = len(column_values)
     fig, axes = plt.subplots(
         n_rows,
         n_cols,
@@ -235,11 +262,11 @@ def plot_metric(agg_df: pd.DataFrame, metric_label: str, output_path: Path, log_
     )
 
     for row_idx, perturbation in enumerate(perturbations):
-        for col_idx, reduction in enumerate(reductions):
+        for col_idx, column_value in enumerate(column_values):
             ax = axes[row_idx][col_idx]
             subset = agg_df[
                 (agg_df["perturbation_type"] == perturbation)
-                & (agg_df["reduction"] == reduction)
+                & (agg_df[column_key] == column_value)
             ]
 
             for control in DEFAULT_CONTROLS:
@@ -262,7 +289,7 @@ def plot_metric(agg_df: pd.DataFrame, metric_label: str, output_path: Path, log_
                 ax.plot(x, y, color=color, linewidth=2, label=label)
                 ax.fill_between(x, lower, upper, color=color, alpha=0.18)
 
-            ax.set_title(f"{perturbation} | {reduction}")
+            ax.set_title(f"{perturbation} | {column_value}")
             ax.set_xlabel("Layer")
             ax.set_ylabel(metric_label)
             if log_scale:
@@ -296,11 +323,12 @@ def main() -> None:
     selected_metrics = select_metrics(metrics_df, args.metric_set)
 
     for metric_col, metric_label, slug in selected_metrics:
-        agg_df = aggregate_metrics(metrics_df, metric_col)
+        agg_df = aggregate_metrics(metrics_df, metric_col, column_mode=args.column_mode)
         plot_metric(
             agg_df,
             metric_label=metric_label,
             output_path=output_dir / f"{slug}_layer_curves.png",
+            column_mode=args.column_mode,
             log_scale=(slug == "error"),
         )
         agg_df.to_csv(output_dir / f"{slug}_layer_curves_summary.csv", index=False)
