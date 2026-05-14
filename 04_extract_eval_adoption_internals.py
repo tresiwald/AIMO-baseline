@@ -1,16 +1,16 @@
 """
-Extract layer-wise hidden states for eval-adoption CSV rows.
+Extract eval-adoption internals for multiple Lamina-supported views.
 
-This reads `dataset_as_table.csv`, runs a causal LM over each `original_problem`,
-and saves one `.npy` file per layer containing the last input-token hidden state.
-The emitted metadata is aligned row-for-row with the saved arrays, so downstream
-probing can subset by `permutation_type` and regress on `absolute_accuracy_decay`.
+For each CSV row, this script runs the model through Lamina and saves one
+internals directory per requested representation view:
 
-Example:
-    ./.venv/bin/python 04_extract_eval_adoption_internals.py \
-        --dataset-csv /Users/tresi/Projects/eval-adoption/dataset_as_table.csv \
-        --model-id Qwen/Qwen2.5-0.5B-Instruct \
-        --output-dir data/eval_adoption_internals
+- `input_last_token`: last prompt token hidden state
+- `last_thinking_token`: last generated token hidden state
+- `output_last_token`: alias for the last generated token hidden state
+- `average_output`: mean hidden state across generated tokens
+
+Each emitted directory contains `metadata.csv` plus `layer_XXX.npy` files, so
+the downstream probing script can be pointed at any one of the views directly.
 """
 
 from __future__ import annotations
@@ -23,7 +23,15 @@ import pandas as pd
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from lamina import InternalsDataset, InternalsInstance
+
 SYSTEM_PROMPT_PATH = "prompts/solve.txt"
+DEFAULT_VIEWS = [
+    "input_last_token",
+    "last_thinking_token",
+    "output_last_token",
+    "average_output",
+]
 
 
 def parse_args() -> argparse.Namespace:
@@ -41,13 +49,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         default="data/eval_adoption_internals",
-        help="Directory to write metadata.csv and layer_XXX.npy files",
+        help="Base directory to write metadata.csv and layer_XXX.npy files",
     )
     parser.add_argument(
         "--device",
         default="auto",
         choices=["auto", "cpu", "cuda"],
         help="Device to run extraction on",
+    )
+    parser.add_argument(
+        "--views",
+        default=",".join(DEFAULT_VIEWS),
+        help=(
+            "Comma-separated extraction views. Supported values: "
+            "input_last_token,last_thinking_token,output_last_token,average_output"
+        ),
+    )
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=256,
+        help="Maximum number of generated tokens captured for output-based views.",
     )
     return parser.parse_args()
 
@@ -60,26 +82,101 @@ def resolve_device(device_arg: str) -> str:
     return device_arg
 
 
-def build_prompt(tokenizer, user_text: str, system_prompt: str) -> str:
-    if hasattr(tokenizer, "apply_chat_template"):
-        try:
-            return tokenizer.apply_chat_template(
-                [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_text},
-                ],
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-        except Exception:
-            pass
-    return f"{system_prompt}\n\n{user_text}"
+def parse_views(views_arg: str) -> list[str]:
+    supported = set(DEFAULT_VIEWS)
+    views = [chunk.strip() for chunk in views_arg.split(",") if chunk.strip()]
+    if not views:
+        raise ValueError("At least one extraction view must be provided.")
+    invalid = sorted(set(views) - supported)
+    if invalid:
+        raise ValueError(f"Unsupported extraction views: {invalid}")
+    return views
+
+
+def view_output_dir(base_dir: Path, view: str) -> Path:
+    return base_dir / view
+
+
+def build_instances(df: pd.DataFrame, system_prompt: str) -> list[InternalsInstance]:
+    return [
+        InternalsInstance(
+            text=row["original_problem"],
+            properties={
+                "row_id": int(row["row_id"]),
+                "problem_id": row["problem_id"],
+                "model_id": row["model_id"],
+                "dataset_id": row["dataset_id"],
+                "permutation_type": row["permutation_type"],
+                "absolute_accuracy_decay": float(row["absolute_accuracy_decay"]),
+                "original_problem": row["original_problem"],
+            },
+            system_prompt=system_prompt,
+        )
+        for _, row in df.iterrows()
+    ]
+
+
+def extract_view_vector(record, view: str, layer_idx: int) -> np.ndarray:
+    run = record.run
+    if view == "input_last_token":
+        if run.input_hidden_states is None:
+            raise RuntimeError("Lamina record has no input_hidden_states.")
+        return np.asarray(run.input_hidden_states[layer_idx][0, -1, :], dtype=np.float32)
+
+    if view in {"last_thinking_token", "output_last_token"}:
+        if run.output_hidden_states is None:
+            raise RuntimeError("Lamina record has no output_hidden_states.")
+        layer_output = run.output_hidden_states[layer_idx]
+        if layer_output.shape[1] == 0:
+            raise RuntimeError("No generated tokens were captured; increase --max-new-tokens.")
+        # Lamina exposes generated-token hidden states. We treat the final
+        # generated token representation as both the "last thinking token"
+        # view and the explicit "output last token" view.
+        return np.asarray(layer_output[0, -1, :], dtype=np.float32)
+
+    if view == "average_output":
+        if run.output_hidden_states_mean is None:
+            raise RuntimeError("Lamina record has no output_hidden_states_mean.")
+        return np.asarray(run.output_hidden_states_mean[layer_idx, 0, :], dtype=np.float32)
+
+    raise ValueError(f"Unknown extraction view: {view}")
+
+
+def save_view(
+    records: list,
+    metadata_rows: list[dict],
+    output_dir: Path,
+    view: str,
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    first_run = records[0].run
+    if view == "input_last_token":
+        source = first_run.input_hidden_states
+    elif view in {"last_thinking_token", "output_last_token"}:
+        source = first_run.output_hidden_states
+    else:
+        source = first_run.output_hidden_states
+
+    if source is None:
+        raise RuntimeError(f"Cannot save view {view!r}: source hidden states are missing.")
+
+    n_layers = len(source)
+    for layer_idx in range(n_layers):
+        layer_vecs = np.stack([
+            extract_view_vector(record, view, layer_idx)
+            for record in records
+        ])
+        np.save(output_dir / f"layer_{layer_idx:03d}.npy", layer_vecs)
+
+    metadata = pd.DataFrame(metadata_rows).sort_values("row_id")
+    metadata.to_csv(output_dir / "metadata.csv", index=False)
 
 
 def main() -> None:
     args = parse_args()
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    base_output_dir = Path(args.output_dir)
+    views = parse_views(args.views)
     device = resolve_device(args.device)
     dtype = torch.bfloat16 if device == "cuda" else torch.float32
 
@@ -95,66 +192,56 @@ def main() -> None:
     model.to(device)
     model.eval()
 
-    layer_storage: list[list[np.ndarray]] | None = None
-    n_layers: int | None = None
-    hidden_dim: int | None = None
-    metadata_rows: list[dict] = []
+    instances = build_instances(df, system_prompt)
+    dataset = InternalsDataset(instances)
 
-    print(f"Extracting internals for {len(df)} rows ...")
-    for idx, row in df.iterrows():
-        print(
-            f"  [{idx + 1:>{len(str(len(df)))}}/{len(df)}]  "
-            f"row_id={int(row['row_id'])}, problem_id={row['problem_id']!r}, model_id={row['model_id']!r}"
-        )
-        prompt = build_prompt(tokenizer, row["original_problem"], system_prompt)
-        enc = tokenizer(prompt, return_tensors="pt", truncation=True)
-        enc = {k: v.to(device) for k, v in enc.items()}
+    print(f"Extracting internals for {len(instances)} rows ...")
+    records = dataset.run(
+        model,
+        tokenizer,
+        generate_kwargs={"max_new_tokens": args.max_new_tokens},
+        verbose=True,
+    )
+    if not records:
+        raise RuntimeError("Lamina returned no records.")
 
-        with torch.no_grad():
-            output = model(
-                **enc,
-                output_hidden_states=True,
-                return_dict=True,
-                use_cache=False,
-            )
+    first_run = records[0].run
+    input_layers = len(first_run.input_hidden_states or [])
+    output_layers = len(first_run.output_hidden_states or [])
+    hidden_dim = None
+    if first_run.input_hidden_states is not None:
+        hidden_dim = first_run.input_hidden_states[0].shape[-1]
+    elif first_run.output_hidden_states is not None:
+        hidden_dim = first_run.output_hidden_states[0].shape[-1]
+    print(
+        f"Input layers: {input_layers} | Output layers: {output_layers} | hidden_dim: {hidden_dim}"
+    )
 
-        hidden_states = output.hidden_states
-        if hidden_states is None:
-            raise RuntimeError(
-                "Model forward pass returned no hidden states. "
-                "Try a newer transformers version or a different model configuration."
-            )
+    base_metadata_rows = [
+        {
+            "row_id": int(record.properties["row_id"]),
+            "problem_id": record.properties["problem_id"],
+            "model_id": record.properties["model_id"],
+            "dataset_id": record.properties["dataset_id"],
+            "permutation_type": record.properties["permutation_type"],
+            "absolute_accuracy_decay": float(record.properties["absolute_accuracy_decay"]),
+            "original_problem": record.properties["original_problem"],
+        }
+        for record in records
+    ]
 
-        if layer_storage is None:
-            n_layers = len(hidden_states)
-            hidden_dim = hidden_states[0].shape[-1]
-            layer_storage = [[] for _ in range(n_layers)]
-            print(f"Layers: {n_layers}  |  hidden_dim: {hidden_dim}")
+    for view in views:
+        print(f"Saving view: {view}")
+        view_metadata_rows = [
+            {**row, "extraction_view": view}
+            for row in base_metadata_rows
+        ]
+        save_view(records, view_metadata_rows, view_output_dir(base_output_dir, view), view)
 
-        for layer_idx, hs in enumerate(hidden_states):
-            vec = hs[0, -1, :].detach().float().cpu().numpy()
-            layer_storage[layer_idx].append(vec)
-
-        metadata_rows.append(
-            {
-                "row_id": int(row["row_id"]),
-                "problem_id": row["problem_id"],
-                "model_id": row["model_id"],
-                "dataset_id": row["dataset_id"],
-                "permutation_type": row["permutation_type"],
-                "absolute_accuracy_decay": float(row["absolute_accuracy_decay"]),
-                "original_problem": row["original_problem"],
-            }
-        )
-
-    assert layer_storage is not None
-    for layer_idx, rows in enumerate(layer_storage):
-        np.save(output_dir / f"layer_{layer_idx:03d}.npy", np.stack(rows))
-
-    metadata = pd.DataFrame(metadata_rows).sort_values("row_id")
-    metadata.to_csv(output_dir / "metadata.csv", index=False)
-
-    print(f"Saved metadata and {len(layer_storage)} layer files to {output_dir}")
+    print(
+        "Saved view directories: "
+        + ", ".join(str(view_output_dir(base_output_dir, view)) for view in views)
+    )
 
 
 if __name__ == "__main__":
