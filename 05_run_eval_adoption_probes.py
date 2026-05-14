@@ -52,7 +52,7 @@ if HOLMES_CORE not in sys.path:
 from probing_worker import GeneralProbeWorker  # noqa: E402
 from utilities.data_loading import ProbingDataset  # noqa: E402
 
-CONTROL_TASKS = ["NONE", "RANDOMIZATION", "PERMUTATION"]
+CONTROL_TASKS = ["NONE", "RANDOMIZATION"]
 DEFAULT_REDUCED_DIM = 0
 DEFAULT_SEEDS = [42, 43, 44, 45, 46]
 DEFAULT_NUM_FOLDS = 4
