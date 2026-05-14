@@ -54,6 +54,8 @@ DEFAULT_NUM_FOLDS = 4
 DEFAULT_DEV_FRACTION = 0.20
 DEFAULT_TARGET_COL = "absolute_accuracy_decay"
 DEFAULT_NUM_WORKERS = os.cpu_count() or 1
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -431,6 +433,53 @@ def evaluate_dataset(
     return prediction_frame, metrics
 
 
+def expected_done_dir(
+    results_dir: str,
+    target_col: str,
+    permutation_type: str,
+    control_task: str,
+    layer_idx: int,
+    model_name: str,
+    fold_idx: int,
+    seed: int,
+) -> Path:
+    probe_name = f"{target_col}__{permutation_type}__{control_task.lower()}__L{layer_idx:03d}"
+    return (
+        Path(results_dir)
+        / f"eval-adoption-{probe_name}"
+        / model_name.replace("/", "__")
+        / "full"
+        / control_task
+        / str(fold_idx)
+        / str(seed)
+        / "0"
+        / "done"
+    )
+
+
+def task_is_done(
+    results_dir: str,
+    target_col: str,
+    permutation_type: str,
+    control_task: str,
+    layer_idx: int,
+    model_name: str,
+    fold_idx: int,
+    seed: int,
+) -> bool:
+    done_dir = expected_done_dir(
+        results_dir=results_dir,
+        target_col=target_col,
+        permutation_type=permutation_type,
+        control_task=control_task,
+        layer_idx=layer_idx,
+        model_name=model_name,
+        fold_idx=fold_idx,
+        seed=seed,
+    )
+    return (done_dir / "metrics.csv").exists()
+
+
 def run_layer(
     layer_idx: int,
     hidden_states: np.ndarray,
@@ -507,7 +556,7 @@ def run_layer(
         probe_name=probe_name,
         project_prefix="eval-adoption",
         dump_preds=True,
-        force=True,
+        force=False,
         result_folder=results_dir,
         logging="local",
     )
@@ -617,6 +666,7 @@ def main() -> None:
     )
 
     tasks: list[dict] = []
+    skipped_done = 0
     for permutation_type, subset in metadata.groupby("permutation_type", sort=True):
         subset = subset.reset_index(drop=True)
         row_ids = subset["row_id"].astype(int).tolist()
@@ -662,6 +712,18 @@ def main() -> None:
                     split_iter = splitter.split(subset_indices)
                 for fold_idx, (train_pool_idx, test_idx) in enumerate(split_iter):
                     for control_task in CONTROL_TASKS:
+                        if task_is_done(
+                            results_dir=args.results_dir,
+                            target_col=args.target_col,
+                            permutation_type=permutation_type,
+                            control_task=control_task,
+                            layer_idx=layer_idx,
+                            model_name=args.model_name,
+                            fold_idx=fold_idx,
+                            seed=seed,
+                        ):
+                            skipped_done += 1
+                            continue
                         tasks.append(
                             {
                                 "internals_dir": internals_dir,
@@ -692,6 +754,8 @@ def main() -> None:
                         )
 
     print(f"Built {len(tasks)} probe task(s)")
+    if skipped_done:
+        print(f"Skipped {skipped_done} already-completed task(s)")
 
     if args.num_workers <= 1:
         for task in tasks:
