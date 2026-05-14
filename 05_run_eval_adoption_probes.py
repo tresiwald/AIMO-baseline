@@ -36,9 +36,14 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
+from scipy.stats import spearmanr
 from sklearn.decomposition import PCA
 from sklearn.metrics import accuracy_score, f1_score, mean_squared_error
+from sklearn.metrics import pairwise_distances
+from sklearn.metrics.pairwise import linear_kernel, rbf_kernel
 from sklearn.model_selection import KFold, StratifiedKFold, train_test_split
+from sklearn.svm import SVC
+from sklearn.kernel_ridge import KernelRidge
 
 HOLMES_CORE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "holmes-evaluation", "core")
 if HOLMES_CORE not in sys.path:
@@ -54,6 +59,11 @@ DEFAULT_NUM_FOLDS = 4
 DEFAULT_DEV_FRACTION = 0.20
 DEFAULT_TARGET_COL = "absolute_accuracy_decay"
 DEFAULT_NUM_WORKERS = os.cpu_count() or 1
+DEFAULT_METHOD = "probe"
+DEFAULT_KERNEL = "rbf"
+DEFAULT_KERNEL_ALPHAS = [0.01, 0.1, 1.0, 10.0]
+DEFAULT_KERNEL_CS = [0.1, 1.0, 10.0, 100.0]
+DEFAULT_KERNEL_GAMMAS = ["scale", 0.001, 0.01, 0.1, 1.0]
 
 
 def parse_args() -> argparse.Namespace:
@@ -112,6 +122,33 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_NUM_WORKERS,
         help="Number of parallel worker processes. Each worker handles one permutation/layer/seed/fold/control task.",
     )
+    parser.add_argument(
+        "--method",
+        default=DEFAULT_METHOD,
+        choices=["probe", "kernel", "cka", "rsa"],
+        help="Evaluation method: linear probe, kernel baseline, centered kernel alignment, or RSA.",
+    )
+    parser.add_argument(
+        "--kernel",
+        default=DEFAULT_KERNEL,
+        choices=["rbf", "linear"],
+        help="Kernel type used when --method kernel.",
+    )
+    parser.add_argument(
+        "--kernel-alphas",
+        default=",".join(str(value) for value in DEFAULT_KERNEL_ALPHAS),
+        help="Comma-separated regularization strengths for kernel ridge regression.",
+    )
+    parser.add_argument(
+        "--kernel-c-values",
+        default=",".join(str(value) for value in DEFAULT_KERNEL_CS),
+        help="Comma-separated C values for kernel SVC classification.",
+    )
+    parser.add_argument(
+        "--kernel-gammas",
+        default=",".join(str(value) for value in DEFAULT_KERNEL_GAMMAS),
+        help="Comma-separated gamma values for RBF kernels. Use 'scale' to derive gamma from train variance.",
+    )
     return parser.parse_args()
 
 
@@ -120,6 +157,28 @@ def parse_seeds(seed_arg: str) -> list[int]:
     if not seeds:
         raise ValueError("At least one seed must be provided")
     return seeds
+
+
+def parse_float_grid(raw: str) -> list[float]:
+    values = [float(chunk.strip()) for chunk in raw.split(",") if chunk.strip()]
+    if not values:
+        raise ValueError("Expected at least one numeric value.")
+    return values
+
+
+def parse_gamma_grid(raw: str) -> list[str | float]:
+    values: list[str | float] = []
+    for chunk in raw.split(","):
+        item = chunk.strip()
+        if not item:
+            continue
+        if item.lower() == "scale":
+            values.append("scale")
+        else:
+            values.append(float(item))
+    if not values:
+        raise ValueError("Expected at least one gamma value.")
+    return values
 
 
 def infer_task_type(series: pd.Series) -> str:
@@ -296,6 +355,60 @@ def make_fold_datasets(
         ood_ds.update_seen(train_ds.unique_inputs)
 
     return train_ds, dev_ds, test_ds, ood_ds
+
+
+def make_fold_arrays(
+    hidden_states: np.ndarray,
+    labels: np.ndarray,
+    row_ids: list[int],
+    permutation_type: str,
+    control_task: str,
+    reduced_dim: int,
+    task_type: str,
+    train_pool_idx: np.ndarray,
+    test_idx: np.ndarray,
+    dev_fraction: float,
+    seed: int,
+    ood_hidden_states: np.ndarray | None = None,
+    ood_labels: np.ndarray | None = None,
+    ood_row_ids: list[int] | None = None,
+) -> dict[str, np.ndarray | list[int] | None]:
+    train_ds, dev_ds, test_ds, ood_ds = make_fold_datasets(
+        hidden_states=hidden_states,
+        labels=labels,
+        row_ids=row_ids,
+        permutation_type=permutation_type,
+        control_task=control_task,
+        reduced_dim=reduced_dim,
+        task_type=task_type,
+        train_pool_idx=train_pool_idx,
+        test_idx=test_idx,
+        dev_fraction=dev_fraction,
+        seed=seed,
+        ood_hidden_states=ood_hidden_states,
+        ood_labels=ood_labels,
+        ood_row_ids=ood_row_ids,
+    )
+
+    result: dict[str, np.ndarray | list[int] | None] = {
+        "train_vecs": np.asarray(train_ds.inputs_encoded, dtype=np.float32),
+        "train_lbls": np.asarray(train_ds.labels),
+        "train_row_ids": [int(item[0][0].split("_")[-1]) for item in train_ds.inputs],
+        "dev_vecs": np.asarray(dev_ds.inputs_encoded, dtype=np.float32),
+        "dev_lbls": np.asarray(dev_ds.labels),
+        "dev_row_ids": [int(item[0][0].split("_")[-1]) for item in dev_ds.inputs],
+        "test_vecs": np.asarray(test_ds.inputs_encoded, dtype=np.float32),
+        "test_lbls": np.asarray(test_ds.labels),
+        "test_row_ids": [int(item[0][0].split("_")[-1]) for item in test_ds.inputs],
+        "ood_vecs": None,
+        "ood_lbls": None,
+        "ood_row_ids": None,
+    }
+    if ood_ds is not None:
+        result["ood_vecs"] = np.asarray(ood_ds.inputs_encoded, dtype=np.float32)
+        result["ood_lbls"] = np.asarray(ood_ds.labels)
+        result["ood_row_ids"] = [int(item[0][0].split("_")[-1]) for item in ood_ds.inputs]
+    return result
 
 
 def run_worker(worker: GeneralProbeWorker) -> tuple[str, pd.DataFrame, torch.nn.Module]:
@@ -480,6 +593,577 @@ def task_is_done(
     return (done_dir / "metrics.csv").exists()
 
 
+def standardize_splits(
+    train_vecs: np.ndarray,
+    dev_vecs: np.ndarray,
+    test_vecs: np.ndarray,
+    ood_vecs: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
+    train_vecs = np.asarray(train_vecs, dtype=np.float64)
+    dev_vecs = np.asarray(dev_vecs, dtype=np.float64)
+    test_vecs = np.asarray(test_vecs, dtype=np.float64)
+    mean = train_vecs.mean(axis=0, keepdims=True)
+    std = train_vecs.std(axis=0, keepdims=True)
+    std[std == 0] = 1.0
+    train_scaled = (train_vecs - mean) / std
+    dev_scaled = (dev_vecs - mean) / std
+    test_scaled = (test_vecs - mean) / std
+    ood_scaled = None if ood_vecs is None else (np.asarray(ood_vecs, dtype=np.float64) - mean) / std
+    return train_scaled, dev_scaled, test_scaled, ood_scaled
+
+
+def resolve_gamma(train_vecs: np.ndarray, gamma: str | float) -> float:
+    if gamma != "scale":
+        return float(gamma)
+    variance = float(np.var(train_vecs))
+    n_features = max(1, int(train_vecs.shape[1]))
+    if variance <= 0:
+        return 1.0 / n_features
+    return 1.0 / (n_features * variance)
+
+
+def compute_kernel_matrix(
+    train_vecs: np.ndarray,
+    other_vecs: np.ndarray,
+    kernel_kind: str,
+    gamma: str | float,
+) -> np.ndarray:
+    if kernel_kind == "linear":
+        return linear_kernel(other_vecs, train_vecs)
+    return rbf_kernel(other_vecs, train_vecs, gamma=resolve_gamma(train_vecs, gamma))
+
+
+def compute_square_kernel_matrix(
+    vecs: np.ndarray,
+    kernel_kind: str,
+    gamma: str | float,
+) -> np.ndarray:
+    if kernel_kind == "linear":
+        return linear_kernel(vecs, vecs)
+    return rbf_kernel(vecs, vecs, gamma=resolve_gamma(vecs, gamma))
+
+
+def label_feature_matrix(labels: np.ndarray, task_type: str) -> np.ndarray:
+    labels = np.asarray(labels)
+    if task_type == "classification":
+        n_classes = int(labels.max()) + 1
+        return np.eye(n_classes, dtype=np.float64)[labels.astype(int)]
+    return labels.astype(np.float64).reshape(-1, 1)
+
+
+def center_gram(kernel: np.ndarray) -> np.ndarray:
+    n = kernel.shape[0]
+    if n == 0:
+        return kernel
+    ones = np.ones((n, n), dtype=np.float64) / n
+    return kernel - ones @ kernel - kernel @ ones + ones @ kernel @ ones
+
+
+def cka_score_from_features(
+    vecs: np.ndarray,
+    labels: np.ndarray,
+    task_type: str,
+    kernel_kind: str,
+    gamma: str | float,
+) -> float:
+    if len(vecs) < 2:
+        return float("nan")
+    x_kernel = center_gram(compute_square_kernel_matrix(np.asarray(vecs, dtype=np.float64), kernel_kind, gamma))
+    y_features = label_feature_matrix(labels, task_type)
+    y_kernel = center_gram(linear_kernel(y_features, y_features))
+    numerator = float(np.sum(x_kernel * y_kernel))
+    denom_x = float(np.linalg.norm(x_kernel, ord="fro"))
+    denom_y = float(np.linalg.norm(y_kernel, ord="fro"))
+    if denom_x <= 0 or denom_y <= 0:
+        return float("nan")
+    return numerator / (denom_x * denom_y)
+
+
+def rsa_score_from_features(
+    vecs: np.ndarray,
+    labels: np.ndarray,
+    task_type: str,
+) -> float:
+    vecs = np.asarray(vecs, dtype=np.float64)
+    labels = np.asarray(labels)
+    if len(vecs) < 3:
+        return float("nan")
+    hidden_dissim = pairwise_distances(vecs, metric="cosine")
+    if task_type == "classification":
+        label_dissim = (labels[:, None] != labels[None, :]).astype(np.float64)
+    else:
+        label_values = labels.astype(np.float64).reshape(-1, 1)
+        label_dissim = pairwise_distances(label_values, metric="euclidean")
+    tri = np.triu_indices_from(hidden_dissim, k=1)
+    hidden_vec = hidden_dissim[tri]
+    label_vec = label_dissim[tri]
+    if np.allclose(hidden_vec.std(), 0.0) or np.allclose(label_vec.std(), 0.0):
+        return float("nan")
+    score = spearmanr(hidden_vec, label_vec, nan_policy="omit").correlation
+    return float(score) if score is not None else float("nan")
+
+
+def safe_pearson(preds: np.ndarray, labels: np.ndarray) -> float:
+    if len(preds) < 2 or np.isclose(np.std(preds), 0.0) or np.isclose(np.std(labels), 0.0):
+        return float("nan")
+    return float(np.corrcoef(preds, labels)[0, 1])
+
+
+def build_prediction_frame(
+    row_ids: list[int],
+    permutation_type: str,
+    preds: np.ndarray,
+    labels: np.ndarray,
+    losses: np.ndarray,
+    prefix: str,
+    seen_label: str,
+) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "instance": [
+                str([(f"{prefix}__{permutation_type}__row_{row_id}", 0, 0, len(f"{prefix}__{permutation_type}__row_{row_id}"))])
+                for row_id in row_ids
+            ],
+            "pred": preds,
+            "label": labels,
+            "loss": losses,
+            "seen": seen_label,
+        }
+    )
+
+
+def select_best_kernel_regression(
+    train_vecs: np.ndarray,
+    train_lbls: np.ndarray,
+    dev_vecs: np.ndarray,
+    dev_lbls: np.ndarray,
+    kernel_kind: str,
+    alphas: list[float],
+    gammas: list[str | float],
+) -> tuple[KernelRidge, dict[str, float | str], np.ndarray]:
+    best_model = None
+    best_params = None
+    best_dev_preds = None
+    best_dev_error = None
+
+    gamma_grid = gammas if kernel_kind == "rbf" else ["scale"]
+    for alpha in alphas:
+        for gamma in gamma_grid:
+            train_kernel = compute_kernel_matrix(train_vecs, train_vecs, kernel_kind, gamma)
+            dev_kernel = compute_kernel_matrix(train_vecs, dev_vecs, kernel_kind, gamma)
+            model = KernelRidge(alpha=alpha, kernel="precomputed")
+            model.fit(train_kernel, train_lbls)
+            dev_preds = model.predict(dev_kernel).astype(np.float64)
+            dev_error = mean_squared_error(dev_lbls, dev_preds)
+            if best_dev_error is None or dev_error < best_dev_error:
+                best_model = model
+                best_params = {"alpha": alpha, "gamma": gamma, "dev_error": float(dev_error)}
+                best_dev_preds = dev_preds
+                best_dev_error = dev_error
+
+    assert best_model is not None and best_params is not None and best_dev_preds is not None
+    return best_model, best_params, best_dev_preds
+
+
+def select_best_kernel_classifier(
+    train_vecs: np.ndarray,
+    train_lbls: np.ndarray,
+    dev_vecs: np.ndarray,
+    dev_lbls: np.ndarray,
+    kernel_kind: str,
+    c_values: list[float],
+    gammas: list[str | float],
+) -> tuple[SVC, dict[str, float | str], np.ndarray]:
+    best_model = None
+    best_params = None
+    best_dev_preds = None
+    best_dev_f1 = None
+
+    gamma_grid = gammas if kernel_kind == "rbf" else ["scale"]
+    for c_value in c_values:
+        for gamma in gamma_grid:
+            train_kernel = compute_kernel_matrix(train_vecs, train_vecs, kernel_kind, gamma)
+            dev_kernel = compute_kernel_matrix(train_vecs, dev_vecs, kernel_kind, gamma)
+            model = SVC(C=c_value, kernel="precomputed")
+            model.fit(train_kernel, train_lbls)
+            dev_preds = model.predict(dev_kernel)
+            dev_f1 = f1_score(dev_lbls, dev_preds, average="macro")
+            if best_dev_f1 is None or dev_f1 > best_dev_f1:
+                best_model = model
+                best_params = {"C": c_value, "gamma": gamma, "dev_f1": float(dev_f1)}
+                best_dev_preds = dev_preds
+                best_dev_f1 = dev_f1
+
+    assert best_model is not None and best_params is not None and best_dev_preds is not None
+    return best_model, best_params, best_dev_preds
+
+
+def write_kernel_outputs(
+    done_dir: Path,
+    metrics_row: dict[str, float | int | str],
+    preds_df: pd.DataFrame,
+    ood_preds_df: pd.DataFrame | None = None,
+    ood_metrics: dict[str, float] | None = None,
+) -> None:
+    done_dir.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([metrics_row]).to_csv(done_dir / "metrics.csv", index=False)
+    preds_df.to_csv(done_dir / "preds.csv")
+    if ood_preds_df is not None:
+        ood_preds_df.to_csv(done_dir / "ood_preds.csv")
+    if ood_metrics is not None:
+        with open(done_dir / "ood_metrics.json", "w", encoding="utf-8") as f:
+            json.dump(ood_metrics, f, indent=2)
+
+
+def build_metric_only_prediction_frame(
+    row_ids: list[int],
+    permutation_type: str,
+    labels: np.ndarray,
+    prefix: str,
+    seen_label: str,
+) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "instance": [
+                str([(f"{prefix}__{permutation_type}__row_{row_id}", 0, 0, len(f"{prefix}__{permutation_type}__row_{row_id}"))])
+                for row_id in row_ids
+            ],
+            "pred": np.nan,
+            "label": np.asarray(labels),
+            "loss": np.nan,
+            "seen": seen_label,
+        }
+    )
+
+
+def run_kernel_layer(
+    layer_idx: int,
+    hidden_states: np.ndarray,
+    labels: np.ndarray,
+    row_ids: list[int],
+    permutation_type: str,
+    control_task: str,
+    reduced_dim: int,
+    target_col: str,
+    task_type: str,
+    seed: int,
+    fold_idx: int,
+    train_pool_idx: np.ndarray,
+    test_idx: np.ndarray,
+    dev_fraction: float,
+    results_dir: str,
+    model_name: str,
+    kernel_kind: str,
+    kernel_alphas: list[float],
+    kernel_c_values: list[float],
+    kernel_gammas: list[str | float],
+    ood_hidden_states: np.ndarray | None = None,
+    ood_labels: np.ndarray | None = None,
+    ood_row_ids: list[int] | None = None,
+) -> None:
+    split = make_fold_arrays(
+        hidden_states=hidden_states,
+        labels=labels,
+        row_ids=row_ids,
+        permutation_type=permutation_type,
+        control_task=control_task,
+        reduced_dim=reduced_dim,
+        task_type=task_type,
+        train_pool_idx=train_pool_idx,
+        test_idx=test_idx,
+        dev_fraction=dev_fraction,
+        seed=seed,
+        ood_hidden_states=ood_hidden_states,
+        ood_labels=ood_labels,
+        ood_row_ids=ood_row_ids,
+    )
+    train_vecs, dev_vecs, test_vecs, ood_vecs = standardize_splits(
+        split["train_vecs"],
+        split["dev_vecs"],
+        split["test_vecs"],
+        split["ood_vecs"],
+    )
+    train_lbls = np.asarray(split["train_lbls"])
+    dev_lbls = np.asarray(split["dev_lbls"])
+    test_lbls = np.asarray(split["test_lbls"])
+    hidden_dim = int(train_vecs.shape[1])
+    done_dir = expected_done_dir(
+        results_dir=results_dir,
+        target_col=target_col,
+        permutation_type=permutation_type,
+        control_task=control_task,
+        layer_idx=layer_idx,
+        model_name=model_name,
+        fold_idx=fold_idx,
+        seed=seed,
+    )
+
+    print(
+        f"  {permutation_type:>9} | {control_task:>13} | "
+        f"seed={seed} | fold={fold_idx} | layer {layer_idx:03d} | n={len(labels)} | d={hidden_dim} | method=kernel"
+    )
+
+    if task_type == "regression":
+        model, best_params, dev_preds = select_best_kernel_regression(
+            train_vecs=train_vecs,
+            train_lbls=train_lbls.astype(np.float64),
+            dev_vecs=dev_vecs,
+            dev_lbls=dev_lbls.astype(np.float64),
+            kernel_kind=kernel_kind,
+            alphas=kernel_alphas,
+            gammas=kernel_gammas,
+        )
+        test_kernel = compute_kernel_matrix(train_vecs, test_vecs, kernel_kind, best_params["gamma"])
+        test_preds = model.predict(test_kernel).astype(np.float64)
+        test_losses = (test_preds - test_lbls.astype(np.float64)) ** 2
+        preds_df = build_prediction_frame(
+            row_ids=split["test_row_ids"],
+            permutation_type=permutation_type,
+            preds=test_preds,
+            labels=test_lbls,
+            losses=test_losses,
+            prefix="test",
+            seen_label="unseen",
+        )
+        metrics_row = {
+            "epoch": 0,
+            "step": 0,
+            "full test error": float(mean_squared_error(test_lbls, test_preds)),
+            "full test pearson": safe_pearson(test_preds, test_lbls.astype(np.float64)),
+            "middle test error": np.nan,
+            "middle test pearson": np.nan,
+            "unseen test error": float(mean_squared_error(test_lbls, test_preds)),
+            "unseen test pearson": safe_pearson(test_preds, test_lbls.astype(np.float64)),
+            "upper test error": np.nan,
+            "upper test pearson": np.nan,
+            "val error": float(mean_squared_error(dev_lbls, dev_preds)),
+            "val loss": float(mean_squared_error(dev_lbls, dev_preds)),
+            "val loss sum": float(np.sum((dev_preds - dev_lbls.astype(np.float64)) ** 2)),
+            "val pearson": safe_pearson(dev_preds, dev_lbls.astype(np.float64)),
+            "val_ref": float(-mean_squared_error(dev_lbls, dev_preds)),
+            "kernel_type": kernel_kind,
+            "kernel_alpha": float(best_params["alpha"]),
+            "kernel_gamma": best_params["gamma"],
+            "method": "kernel",
+        }
+        ood_preds_df = None
+        ood_metrics = None
+        if ood_vecs is not None and split["ood_lbls"] is not None and split["ood_row_ids"] is not None:
+            ood_kernel = compute_kernel_matrix(train_vecs, ood_vecs, kernel_kind, best_params["gamma"])
+            ood_preds = model.predict(ood_kernel).astype(np.float64)
+            ood_losses = (ood_preds - np.asarray(split["ood_lbls"], dtype=np.float64)) ** 2
+            ood_preds_df = build_prediction_frame(
+                row_ids=split["ood_row_ids"],
+                permutation_type=permutation_type,
+                preds=ood_preds,
+                labels=np.asarray(split["ood_lbls"]),
+                losses=ood_losses,
+                prefix="ood",
+                seen_label="ood",
+            )
+            ood_metrics = {
+                "ood test error": float(mean_squared_error(split["ood_lbls"], ood_preds)),
+                "ood test pearson": safe_pearson(ood_preds, np.asarray(split["ood_lbls"], dtype=np.float64)),
+            }
+    else:
+        model, best_params, dev_preds = select_best_kernel_classifier(
+            train_vecs=train_vecs,
+            train_lbls=train_lbls.astype(np.int64),
+            dev_vecs=dev_vecs,
+            dev_lbls=dev_lbls.astype(np.int64),
+            kernel_kind=kernel_kind,
+            c_values=kernel_c_values,
+            gammas=kernel_gammas,
+        )
+        test_kernel = compute_kernel_matrix(train_vecs, test_vecs, kernel_kind, best_params["gamma"])
+        test_preds = model.predict(test_kernel).astype(np.int64)
+        test_losses = (test_preds != test_lbls.astype(np.int64)).astype(np.float64)
+        preds_df = build_prediction_frame(
+            row_ids=split["test_row_ids"],
+            permutation_type=permutation_type,
+            preds=test_preds,
+            labels=test_lbls,
+            losses=test_losses,
+            prefix="test",
+            seen_label="unseen",
+        )
+        metrics_row = {
+            "epoch": 0,
+            "step": 0,
+            "full test acc": float(accuracy_score(test_lbls, test_preds)),
+            "full test f1": float(f1_score(test_lbls, test_preds, average="macro")),
+            "middle test acc": np.nan,
+            "middle test f1": np.nan,
+            "unseen test acc": float(accuracy_score(test_lbls, test_preds)),
+            "unseen test f1": float(f1_score(test_lbls, test_preds, average="macro")),
+            "upper test acc": np.nan,
+            "upper test f1": np.nan,
+            "val acc": float(accuracy_score(dev_lbls, dev_preds)),
+            "val f1": float(f1_score(dev_lbls, dev_preds, average="macro")),
+            "val_ref": float(f1_score(dev_lbls, dev_preds, average="macro")),
+            "kernel_type": kernel_kind,
+            "kernel_c": float(best_params["C"]),
+            "kernel_gamma": best_params["gamma"],
+            "method": "kernel",
+        }
+        ood_preds_df = None
+        ood_metrics = None
+        if ood_vecs is not None and split["ood_lbls"] is not None and split["ood_row_ids"] is not None:
+            ood_kernel = compute_kernel_matrix(train_vecs, ood_vecs, kernel_kind, best_params["gamma"])
+            ood_preds = model.predict(ood_kernel).astype(np.int64)
+            ood_losses = (ood_preds != np.asarray(split["ood_lbls"], dtype=np.int64)).astype(np.float64)
+            ood_preds_df = build_prediction_frame(
+                row_ids=split["ood_row_ids"],
+                permutation_type=permutation_type,
+                preds=ood_preds,
+                labels=np.asarray(split["ood_lbls"]),
+                losses=ood_losses,
+                prefix="ood",
+                seen_label="ood",
+            )
+            ood_metrics = {
+                "ood test acc": float(accuracy_score(split["ood_lbls"], ood_preds)),
+                "ood test f1": float(f1_score(split["ood_lbls"], ood_preds, average="macro")),
+            }
+
+    write_kernel_outputs(done_dir, metrics_row, preds_df, ood_preds_df=ood_preds_df, ood_metrics=ood_metrics)
+
+
+def run_similarity_layer(
+    layer_idx: int,
+    hidden_states: np.ndarray,
+    labels: np.ndarray,
+    row_ids: list[int],
+    permutation_type: str,
+    control_task: str,
+    reduced_dim: int,
+    target_col: str,
+    task_type: str,
+    seed: int,
+    fold_idx: int,
+    train_pool_idx: np.ndarray,
+    test_idx: np.ndarray,
+    dev_fraction: float,
+    results_dir: str,
+    model_name: str,
+    method: str,
+    kernel_kind: str,
+    kernel_gammas: list[str | float],
+    ood_hidden_states: np.ndarray | None = None,
+    ood_labels: np.ndarray | None = None,
+    ood_row_ids: list[int] | None = None,
+) -> None:
+    split = make_fold_arrays(
+        hidden_states=hidden_states,
+        labels=labels,
+        row_ids=row_ids,
+        permutation_type=permutation_type,
+        control_task=control_task,
+        reduced_dim=reduced_dim,
+        task_type=task_type,
+        train_pool_idx=train_pool_idx,
+        test_idx=test_idx,
+        dev_fraction=dev_fraction,
+        seed=seed,
+        ood_hidden_states=ood_hidden_states,
+        ood_labels=ood_labels,
+        ood_row_ids=ood_row_ids,
+    )
+    train_vecs, dev_vecs, test_vecs, ood_vecs = standardize_splits(
+        split["train_vecs"],
+        split["dev_vecs"],
+        split["test_vecs"],
+        split["ood_vecs"],
+    )
+    dev_lbls = np.asarray(split["dev_lbls"])
+    test_lbls = np.asarray(split["test_lbls"])
+    done_dir = expected_done_dir(
+        results_dir=results_dir,
+        target_col=target_col,
+        permutation_type=permutation_type,
+        control_task=control_task,
+        layer_idx=layer_idx,
+        model_name=model_name,
+        fold_idx=fold_idx,
+        seed=seed,
+    )
+    print(
+        f"  {permutation_type:>9} | {control_task:>13} | "
+        f"seed={seed} | fold={fold_idx} | layer {layer_idx:03d} | n={len(labels)} | d={train_vecs.shape[1]} | method={method}"
+    )
+
+    if method == "cka":
+        gamma = kernel_gammas[0] if kernel_kind == "rbf" else "scale"
+        dev_score = cka_score_from_features(dev_vecs, dev_lbls, task_type, kernel_kind, gamma)
+        test_score = cka_score_from_features(test_vecs, test_lbls, task_type, kernel_kind, gamma)
+        metrics_row = {
+            "epoch": 0,
+            "step": 0,
+            "full test cka": test_score,
+            "middle test cka": np.nan,
+            "unseen test cka": test_score,
+            "upper test cka": np.nan,
+            "val cka": dev_score,
+            "val_ref": dev_score,
+            "kernel_type": kernel_kind,
+            "kernel_gamma": gamma,
+            "method": "cka",
+        }
+        ood_metrics = None
+        if ood_vecs is not None and split["ood_lbls"] is not None:
+            ood_metrics = {
+                "ood test cka": cka_score_from_features(
+                    ood_vecs,
+                    np.asarray(split["ood_lbls"]),
+                    task_type,
+                    kernel_kind,
+                    gamma,
+                )
+            }
+    else:
+        dev_score = rsa_score_from_features(dev_vecs, dev_lbls, task_type)
+        test_score = rsa_score_from_features(test_vecs, test_lbls, task_type)
+        metrics_row = {
+            "epoch": 0,
+            "step": 0,
+            "full test rsa": test_score,
+            "middle test rsa": np.nan,
+            "unseen test rsa": test_score,
+            "upper test rsa": np.nan,
+            "val rsa": dev_score,
+            "val_ref": dev_score,
+            "method": "rsa",
+        }
+        ood_metrics = None
+        if ood_vecs is not None and split["ood_lbls"] is not None:
+            ood_metrics = {
+                "ood test rsa": rsa_score_from_features(
+                    ood_vecs,
+                    np.asarray(split["ood_lbls"]),
+                    task_type,
+                )
+            }
+
+    preds_df = build_metric_only_prediction_frame(
+        row_ids=split["test_row_ids"],
+        permutation_type=permutation_type,
+        labels=test_lbls,
+        prefix="test",
+        seen_label="unseen",
+    )
+    ood_preds_df = None
+    if split["ood_lbls"] is not None and split["ood_row_ids"] is not None:
+        ood_preds_df = build_metric_only_prediction_frame(
+            row_ids=split["ood_row_ids"],
+            permutation_type=permutation_type,
+            labels=np.asarray(split["ood_lbls"]),
+            prefix="ood",
+            seen_label="ood",
+        )
+
+    write_kernel_outputs(done_dir, metrics_row, preds_df, ood_preds_df=ood_preds_df, ood_metrics=ood_metrics)
+
+
 def run_layer(
     layer_idx: int,
     hidden_states: np.ndarray,
@@ -580,29 +1264,81 @@ def run_probe_task(task: dict) -> dict:
         ood_labels = task["ood_labels"]
         ood_row_ids = task["ood_row_ids"]
 
-    run_layer(
-        layer_idx=task["layer_idx"],
-        hidden_states=subset_states,
-        labels=task["labels"],
-        row_ids=task["row_ids"],
-        permutation_type=task["permutation_type"],
-        control_task=task["control_task"],
-        reduced_dim=task["reduced_dim"],
-        target_col=task["target_col"],
-        task_type=task["task_type"],
-        num_labels=task["num_labels"],
-        seed=task["seed"],
-        fold_idx=task["fold_idx"],
-        train_pool_idx=task["train_pool_idx"],
-        test_idx=task["test_idx"],
-        dev_fraction=task["dev_fraction"],
-        n_total_layers=task["n_total_layers"],
-        results_dir=task["results_dir"],
-        model_name=task["model_name"],
-        ood_hidden_states=ood_layer_states,
-        ood_labels=ood_labels,
-        ood_row_ids=ood_row_ids,
-    )
+    if task["method"] == "kernel":
+        run_kernel_layer(
+            layer_idx=task["layer_idx"],
+            hidden_states=subset_states,
+            labels=task["labels"],
+            row_ids=task["row_ids"],
+            permutation_type=task["permutation_type"],
+            control_task=task["control_task"],
+            reduced_dim=task["reduced_dim"],
+            target_col=task["target_col"],
+            task_type=task["task_type"],
+            seed=task["seed"],
+            fold_idx=task["fold_idx"],
+            train_pool_idx=task["train_pool_idx"],
+            test_idx=task["test_idx"],
+            dev_fraction=task["dev_fraction"],
+            results_dir=task["results_dir"],
+            model_name=task["model_name"],
+            kernel_kind=task["kernel"],
+            kernel_alphas=task["kernel_alphas"],
+            kernel_c_values=task["kernel_c_values"],
+            kernel_gammas=task["kernel_gammas"],
+            ood_hidden_states=ood_layer_states,
+            ood_labels=ood_labels,
+            ood_row_ids=ood_row_ids,
+        )
+    elif task["method"] in {"cka", "rsa"}:
+        run_similarity_layer(
+            layer_idx=task["layer_idx"],
+            hidden_states=subset_states,
+            labels=task["labels"],
+            row_ids=task["row_ids"],
+            permutation_type=task["permutation_type"],
+            control_task=task["control_task"],
+            reduced_dim=task["reduced_dim"],
+            target_col=task["target_col"],
+            task_type=task["task_type"],
+            seed=task["seed"],
+            fold_idx=task["fold_idx"],
+            train_pool_idx=task["train_pool_idx"],
+            test_idx=task["test_idx"],
+            dev_fraction=task["dev_fraction"],
+            results_dir=task["results_dir"],
+            model_name=task["model_name"],
+            method=task["method"],
+            kernel_kind=task["kernel"],
+            kernel_gammas=task["kernel_gammas"],
+            ood_hidden_states=ood_layer_states,
+            ood_labels=ood_labels,
+            ood_row_ids=ood_row_ids,
+        )
+    else:
+        run_layer(
+            layer_idx=task["layer_idx"],
+            hidden_states=subset_states,
+            labels=task["labels"],
+            row_ids=task["row_ids"],
+            permutation_type=task["permutation_type"],
+            control_task=task["control_task"],
+            reduced_dim=task["reduced_dim"],
+            target_col=task["target_col"],
+            task_type=task["task_type"],
+            num_labels=task["num_labels"],
+            seed=task["seed"],
+            fold_idx=task["fold_idx"],
+            train_pool_idx=task["train_pool_idx"],
+            test_idx=task["test_idx"],
+            dev_fraction=task["dev_fraction"],
+            n_total_layers=task["n_total_layers"],
+            results_dir=task["results_dir"],
+            model_name=task["model_name"],
+            ood_hidden_states=ood_layer_states,
+            ood_labels=ood_labels,
+            ood_row_ids=ood_row_ids,
+        )
     return {
         "permutation_type": task["permutation_type"],
         "layer_idx": task["layer_idx"],
@@ -618,6 +1354,9 @@ def main() -> None:
     os.makedirs(args.results_dir, exist_ok=True)
 
     seeds = parse_seeds(args.seeds)
+    kernel_alphas = parse_float_grid(args.kernel_alphas)
+    kernel_c_values = parse_float_grid(args.kernel_c_values)
+    kernel_gammas = parse_gamma_grid(args.kernel_gammas)
     metadata, layer_files = load_internals(internals_dir)
     if args.target_col not in metadata.columns:
         raise ValueError(
@@ -659,7 +1398,7 @@ def main() -> None:
             raise ValueError(f"Classification target {args.target_col!r} has fewer than 2 classes.")
 
     print(
-        f"Probing {n_layers} layers across "
+        f"Running method={args.method} over {n_layers} layers across "
         f"{metadata['permutation_type'].nunique()} permutation types, "
         f"{len(CONTROL_TASKS)} control settings, target={args.target_col}, task={task_type}, "
         f"{len(seeds)} seeds, {args.num_folds} folds, and {args.num_workers} worker(s)"
@@ -739,6 +1478,11 @@ def main() -> None:
                                 "target_col": args.target_col,
                                 "task_type": task_type,
                                 "num_labels": num_labels,
+                                "method": args.method,
+                                "kernel": args.kernel,
+                                "kernel_alphas": kernel_alphas,
+                                "kernel_c_values": kernel_c_values,
+                                "kernel_gammas": kernel_gammas,
                                 "seed": seed,
                                 "fold_idx": fold_idx,
                                 "train_pool_idx": train_pool_idx,
