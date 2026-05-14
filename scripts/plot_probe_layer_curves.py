@@ -220,7 +220,7 @@ def aggregate_metrics(metrics_df: pd.DataFrame, metric_col: str) -> pd.DataFrame
     return grouped
 
 
-def plot_metric(agg_df: pd.DataFrame, metric_label: str, output_path: Path) -> None:
+def plot_metric(agg_df: pd.DataFrame, metric_label: str, output_path: Path, log_scale: bool = False) -> None:
     perturbations = sorted(agg_df["perturbation_type"].unique())
     reductions = [r for r in REDUCTION_ORDER if r in set(agg_df["reduction"].unique())]
 
@@ -249,14 +249,24 @@ def plot_metric(agg_df: pd.DataFrame, metric_label: str, output_path: Path) -> N
                 x = control_df["layer"].to_numpy()
                 y = control_df["metric_mean"].to_numpy()
                 y_std = control_df["metric_std"].to_numpy()
+                if log_scale:
+                    eps = 1e-12
+                    y = np.clip(y, eps, None)
+                    lower = np.clip(y - y_std, eps, None)
+                    upper = np.clip(y + y_std, eps, None)
+                else:
+                    lower = y - y_std
+                    upper = y + y_std
                 color = CONTROL_COLORS[control]
                 label = CONTROL_LABELS[control]
                 ax.plot(x, y, color=color, linewidth=2, label=label)
-                ax.fill_between(x, y - y_std, y + y_std, color=color, alpha=0.18)
+                ax.fill_between(x, lower, upper, color=color, alpha=0.18)
 
             ax.set_title(f"{perturbation} | {reduction}")
             ax.set_xlabel("Layer")
             ax.set_ylabel(metric_label)
+            if log_scale:
+                ax.set_yscale("log")
             ax.grid(alpha=0.25)
 
     handles, labels = axes[0][0].get_legend_handles_labels()
@@ -291,6 +301,7 @@ def main() -> None:
             agg_df,
             metric_label=metric_label,
             output_path=output_dir / f"{slug}_layer_curves.png",
+            log_scale=(slug == "error"),
         )
         agg_df.to_csv(output_dir / f"{slug}_layer_curves_summary.csv", index=False)
 
