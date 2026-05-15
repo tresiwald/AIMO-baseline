@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
 PYTHON_BIN="${PYTHON_BIN:-./.venv-jlab/bin/python}"
-DATASET_CSV="${DATASET_CSV:-data/math-robust-agg.csv}"
+DATASET_CSV="${DATASET_CSV:-data/math-robust-final.csv}"
 MODEL_ID="${MODEL_ID:-deepseek-ai/DeepSeek-R1-0528-Qwen3-8B}"
 OUTPUT_DIR="${OUTPUT_DIR:-data/eval_adoption_internals_table_filtered}"
 DEVICE="${DEVICE:-auto}"

@@ -69,7 +69,7 @@ Direct run:
 
 ```bash
 python scripts/encode.py \
-  --dataset-csv data/math-robust-agg.csv \
+  --dataset-csv data/math-robust-final.csv \
   --model-id deepseek-ai/DeepSeek-R1-0528-Qwen3-8B \
   --output-dir data/eval_adoption_internals_table_filtered \
   --device cuda
@@ -84,7 +84,7 @@ bash run_encoding.bash
 Example override:
 
 ```bash
-DATASET_CSV=data/math-robust-agg.csv \
+DATASET_CSV=data/math-robust-final.csv \
 OUTPUT_DIR=data/eval_adoption_internals_table_filtered \
 bash run_encoding.bash
 ```
