@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """
-Summarize the best classification accuracy per permutation type.
+Summarize the best accuracy-like metric per permutation type.
 
-This script scans one result group, aggregates classification metrics across
-seed/fold runs, and selects the best layer for each permutation type. By
-default it uses balanced accuracy.
+This script scans one result group, aggregates metrics across seed/fold runs,
+and selects the best layer for each permutation type. It supports both:
+
+- classification runs via metrics like `full test balanced_acc`
+- regression runs via thresholded binary metrics like
+  `full test threshold_balanced_accuracy`
 """
 
 from __future__ import annotations
@@ -21,7 +24,14 @@ PROBE_RE = re.compile(
     re.IGNORECASE,
 )
 DEFAULT_CONTROLS = ["NONE", "RANDOMIZATION"]
-METRIC_CHOICES = ["full test balanced_acc", "full test acc", "full test f1"]
+METRIC_CHOICES = [
+    "auto",
+    "full test threshold_balanced_accuracy",
+    "full test threshold_accuracy",
+    "full test balanced_acc",
+    "full test acc",
+    "full test f1",
+]
 
 
 def parse_args() -> argparse.Namespace:
@@ -34,14 +44,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--target-prefix",
-        default="is_robust",
+        default="absolute_accuracy_decay",
         help="Only include probe names whose target prefix matches this string.",
     )
     parser.add_argument(
         "--metric",
-        default="full test balanced_acc",
+        default="auto",
         choices=METRIC_CHOICES,
-        help="Classification metric used to pick the best layer.",
+        help="Metric used to pick the best layer. Use 'auto' to prefer thresholded balanced accuracy, then balanced accuracy, then accuracy, then F1.",
     )
     parser.add_argument(
         "--controls",
@@ -71,8 +81,26 @@ def parse_metrics_path(results_dir: Path, metrics_path: Path) -> dict | None:
     }
 
 
-def load_runs(results_dir: Path, target_prefix: str, controls: set[str], metric: str) -> pd.DataFrame:
+def resolve_metric(columns: list[str], requested_metric: str) -> str | None:
+    if requested_metric != "auto":
+        return requested_metric if requested_metric in columns else None
+
+    candidates = [
+        "full test threshold_balanced_accuracy",
+        "full test balanced_acc",
+        "full test threshold_accuracy",
+        "full test acc",
+        "full test f1",
+    ]
+    for metric in candidates:
+        if metric in columns:
+            return metric
+    return None
+
+
+def load_runs(results_dir: Path, target_prefix: str, controls: set[str], requested_metric: str) -> tuple[pd.DataFrame, str]:
     rows: list[dict] = []
+    chosen_metric: str | None = None
     for metrics_path in results_dir.rglob("metrics.csv"):
         parsed = parse_metrics_path(results_dir, metrics_path)
         if parsed is None:
@@ -83,7 +111,15 @@ def load_runs(results_dir: Path, target_prefix: str, controls: set[str], metric:
             continue
 
         df = pd.read_csv(metrics_path)
-        if df.empty or metric not in df.columns:
+        if df.empty:
+            continue
+
+        metric = resolve_metric(df.columns.tolist(), requested_metric)
+        if metric is None:
+            continue
+        if chosen_metric is None:
+            chosen_metric = metric
+        elif metric != chosen_metric:
             continue
 
         metric_row = df.iloc[-1]
@@ -99,8 +135,12 @@ def load_runs(results_dir: Path, target_prefix: str, controls: set[str], metric:
         )
 
     if not rows:
-        raise ValueError(f"No matching metrics with column {metric!r} found in {results_dir}")
-    return pd.DataFrame(rows)
+        raise ValueError(
+            f"No matching metrics found in {results_dir} for target {target_prefix!r}. "
+            f"Tried metric={requested_metric!r}."
+        )
+    assert chosen_metric is not None
+    return pd.DataFrame(rows), chosen_metric
 
 
 def aggregate_runs(runs_df: pd.DataFrame, metric: str) -> pd.DataFrame:
@@ -133,19 +173,20 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     controls = {chunk.strip().upper() for chunk in args.controls.split(",") if chunk.strip()}
-    runs_df = load_runs(
+    runs_df, resolved_metric = load_runs(
         results_dir=results_dir,
         target_prefix=args.target_prefix,
         controls=controls,
-        metric=args.metric,
+        requested_metric=args.metric,
     )
-    agg_df = aggregate_runs(runs_df, args.metric)
+    agg_df = aggregate_runs(runs_df, resolved_metric)
     best_df = select_best_layers(agg_df)
 
     runs_df.to_csv(output_dir / "raw_runs.csv", index=False)
     agg_df.to_csv(output_dir / "layer_averages.csv", index=False)
     best_df.to_csv(output_dir / "best_by_permutation_type.csv", index=False)
 
+    print(f"\nUsing metric: {resolved_metric}")
     print("\nBest layer per permutation type:")
     print(best_df.to_string(index=False))
     print(f"\nWrote: {output_dir / 'best_by_permutation_type.csv'}")
