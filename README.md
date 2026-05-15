@@ -39,6 +39,9 @@ For a server-style setup, use:
 bash scripts/setup_server.sh
 ```
 
+By default this installs the CUDA 12.1 PyTorch wheels, which are a safer match
+for older NVIDIA drivers than the latest CUDA wheels.
+
 Manual setup:
 
 ```bash
@@ -46,6 +49,7 @@ python3 -m venv .venv-jlab
 source .venv-jlab/bin/activate
 pip install --upgrade pip setuptools wheel
 pip install -r requirements.txt
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 ```
 
 If `holmes-evaluation` is missing:

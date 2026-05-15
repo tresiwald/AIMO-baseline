@@ -5,7 +5,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV_DIR="${VENV_DIR:-$ROOT_DIR/.venv-jlab}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
-TORCH_INDEX_URL="${TORCH_INDEX_URL:-}"
+TORCH_INDEX_URL="${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu121}"
 INSTALL_KERNEL="${INSTALL_KERNEL:-1}"
 KERNEL_NAME="${KERNEL_NAME:-aimo-eval-probes}"
 KERNEL_DISPLAY_NAME="${KERNEL_DISPLAY_NAME:-AIMO Eval Probes}"
@@ -37,11 +37,7 @@ BASE_PACKAGES=(
 
 python -m pip install "${BASE_PACKAGES[@]}"
 
-if [[ -n "$TORCH_INDEX_URL" ]]; then
-  python -m pip install torch torchvision torchaudio --index-url "$TORCH_INDEX_URL"
-else
-  python -m pip install torch torchvision torchaudio
-fi
+python -m pip install torch torchvision torchaudio --index-url "$TORCH_INDEX_URL"
 
 if [[ "$INSTALL_KERNEL" == "1" ]]; then
   python -m ipykernel install --user --name "$KERNEL_NAME" --display-name "$KERNEL_DISPLAY_NAME"
@@ -58,7 +54,10 @@ Setup complete.
 Activate:
   source "$VENV_DIR/bin/activate"
 
-If you need a CUDA-specific PyTorch build, rerun with for example:
-  TORCH_INDEX_URL=https://download.pytorch.org/whl/cu121 bash scripts/setup_server.sh
+PyTorch wheel index:
+  $TORCH_INDEX_URL
+
+If you need a different build, rerun with for example:
+  TORCH_INDEX_URL=https://download.pytorch.org/whl/cu118 bash scripts/setup_server.sh
 
 EOF
