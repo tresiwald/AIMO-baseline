@@ -8,8 +8,8 @@ For each `permutation_type`, this script:
 4. writes results via the Holmes CSV logger.
 
 The default target is `absolute_accuracy_decay`, but the script can also run
-classification probes, e.g. against `is_robust`. Task type is inferred from
-the target column values.
+classification probes, e.g. against `model_is_robust`. Task type is inferred
+from the target column values.
 
 `permutation_type` is an eval-adoption perturbation label, not a Holmes control
 task. We therefore keep it in the probe name and dataset row identifiers, while
@@ -61,7 +61,7 @@ DEFAULT_KERNEL = "rbf"
 DEFAULT_KERNEL_ALPHAS = [0.01, 0.1, 1.0, 10.0]
 DEFAULT_KERNEL_CS = [0.1, 1.0, 10.0, 100.0]
 DEFAULT_KERNEL_GAMMAS = ["scale", 0.001, 0.01, 0.1, 1.0]
-DEFAULT_BINARY_EVAL_COL = "is_robust"
+DEFAULT_BINARY_EVAL_COL = "model_is_robust"
 
 
 def parse_args() -> argparse.Namespace:
@@ -107,7 +107,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--target-col",
         default=DEFAULT_TARGET_COL,
-        help="Metadata column used as the probe target, e.g. absolute_accuracy_decay or is_robust. Task type is inferred from its values.",
+        help="Metadata column used as the probe target, e.g. absolute_accuracy_decay or model_is_robust. Task type is inferred from its values.",
     )
     parser.add_argument(
         "--num-workers",

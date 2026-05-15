@@ -31,6 +31,7 @@ BASE_PACKAGES=(
   ipykernel
   jupyterlab
   pytorch-lightning
+  redis
   retry
   transformers
 )

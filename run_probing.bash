@@ -15,7 +15,7 @@ SEEDS="${SEEDS:-42,43,44,45,46}"
 NUM_FOLDS="${NUM_FOLDS:-4}"
 DEV_FRACTION="${DEV_FRACTION:-0.2}"
 NUM_WORKERS="${NUM_WORKERS:-}"
-BINARY_EVAL_COL="${BINARY_EVAL_COL:-}"
+BINARY_EVAL_COL="${BINARY_EVAL_COL:-model_is_robust}"
 THRESHOLD="${THRESHOLD:-auto}"
 KERNEL="${KERNEL:-rbf}"
 
@@ -76,9 +76,7 @@ while IFS= read -r INTERNALS_DIR; do
     if [[ -n "$NUM_WORKERS" ]]; then
       ARGS+=(--num-workers "$NUM_WORKERS")
     fi
-    if [[ -n "$BINARY_EVAL_COL" ]]; then
-      ARGS+=(--binary-eval-col "$BINARY_EVAL_COL" --threshold "$THRESHOLD")
-    fi
+    ARGS+=(--binary-eval-col "$BINARY_EVAL_COL" --threshold "$THRESHOLD")
     if [[ "$METHOD" == "kernel" ]]; then
       ARGS+=(--kernel "$KERNEL")
     fi
