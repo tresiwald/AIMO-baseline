@@ -23,7 +23,7 @@ Within each subplot:
 from __future__ import annotations
 
 import argparse
-import math
+import json
 import re
 from pathlib import Path
 
@@ -48,14 +48,28 @@ CONTROL_LABELS = {
 DEFAULT_CONTROLS = ["NONE", "RANDOMIZATION"]
 REDUCTION_ORDER = ["full", "pca10", "pca50"]
 ORIGIN_ORDER = ["input_last_token", "last_thinking_token", "output_last_token", "average_output"]
-REGRESSION_METRICS = [
-    ("full test pearson", "Pearson correlation", "pearson"),
-    ("full test error", "Test error", "error"),
-]
-CLASSIFICATION_METRICS = [
-    ("full test acc", "Accuracy", "acc"),
-    ("full test f1", "Macro F1", "f1"),
-]
+def metric_specs(scope: str) -> tuple[list[tuple[str, str, str]], list[tuple[str, str, str]]]:
+    if scope == "ood":
+        return (
+            [
+                ("ood test pearson", "OOD Pearson correlation", "ood_pearson"),
+                ("ood test error", "OOD test error", "ood_error"),
+            ],
+            [
+                ("ood test acc", "OOD accuracy", "ood_acc"),
+                ("ood test f1", "OOD macro F1", "ood_f1"),
+            ],
+        )
+    return (
+        [
+            ("full test pearson", "Pearson correlation", "pearson"),
+            ("full test error", "Test error", "error"),
+        ],
+        [
+            ("full test acc", "Accuracy", "acc"),
+            ("full test f1", "Macro F1", "f1"),
+        ],
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -97,6 +111,12 @@ def parse_args() -> argparse.Namespace:
         default="reduction",
         choices=["reduction", "origin"],
         help="Which run dimension to place in subplot columns.",
+    )
+    parser.add_argument(
+        "--metric-scope",
+        default="full",
+        choices=["full", "ood"],
+        help="Plot in-distribution full-test metrics or OOD metrics from ood_metrics.json.",
     )
     return parser.parse_args()
 
@@ -158,10 +178,18 @@ def parse_metrics_path(group_dir: Path, metrics_path: Path) -> dict | None:
     }
 
 
-def load_metrics(group_dirs: list[Path], controls: set[str], target_prefix: str) -> pd.DataFrame:
+def load_metrics(
+    group_dirs: list[Path],
+    controls: set[str],
+    target_prefix: str,
+    metric_scope: str,
+) -> pd.DataFrame:
+    regression_metrics, classification_metrics = metric_specs(metric_scope)
+    metric_columns = [name for name, _, _ in regression_metrics + classification_metrics]
     rows: list[dict] = []
     for group_dir in group_dirs:
-        for metrics_path in group_dir.rglob("metrics.csv"):
+        pattern = "ood_metrics.json" if metric_scope == "ood" else "metrics.csv"
+        for metrics_path in group_dir.rglob(pattern):
             parsed = parse_metrics_path(group_dir, metrics_path)
             if parsed is None:
                 continue
@@ -170,33 +198,24 @@ def load_metrics(group_dirs: list[Path], controls: set[str], target_prefix: str)
             if parsed["target"] != target_prefix:
                 continue
 
-            df = pd.read_csv(metrics_path)
-            if df.empty:
-                continue
-            regression_mask = pd.Series(False, index=df.index)
-            if "full test pearson" in df.columns:
-                regression_mask = regression_mask | df["full test pearson"].notna()
-            if "full test error" in df.columns:
-                regression_mask = regression_mask | df["full test error"].notna()
+            if metric_scope == "ood":
+                metric_row = json.loads(metrics_path.read_text())
+            else:
+                df = pd.read_csv(metrics_path)
+                if df.empty:
+                    continue
+                regression_mask = pd.Series(False, index=df.index)
+                for metric_col, _, _ in regression_metrics:
+                    if metric_col in df.columns:
+                        regression_mask = regression_mask | df[metric_col].notna()
+                classification_mask = pd.Series(False, index=df.index)
+                for metric_col, _, _ in classification_metrics:
+                    if metric_col in df.columns:
+                        classification_mask = classification_mask | df[metric_col].notna()
+                row = df[regression_mask | classification_mask]
+                metric_row = row.iloc[-1].to_dict() if not row.empty else df.iloc[-1].to_dict()
 
-            classification_mask = pd.Series(False, index=df.index)
-            if "full test acc" in df.columns:
-                classification_mask = classification_mask | df["full test acc"].notna()
-            if "full test f1" in df.columns:
-                classification_mask = classification_mask | df["full test f1"].notna()
-
-            row = df[regression_mask | classification_mask]
-            metric_row = row.iloc[-1] if not row.empty else df.iloc[-1]
-
-            rows.append(
-                {
-                    **parsed,
-                    "full test pearson": metric_row.get("full test pearson", np.nan),
-                    "full test error": metric_row.get("full test error", np.nan),
-                    "full test acc": metric_row.get("full test acc", np.nan),
-                    "full test f1": metric_row.get("full test f1", np.nan),
-                }
-            )
+            rows.append({**parsed, **{col: metric_row.get(col, np.nan) for col in metric_columns}})
 
     if not rows:
         raise ValueError("No matching metrics were found.")
@@ -204,25 +223,26 @@ def load_metrics(group_dirs: list[Path], controls: set[str], target_prefix: str)
     return pd.DataFrame(rows)
 
 
-def select_metrics(metrics_df: pd.DataFrame, metric_set: str) -> list[tuple[str, str, str]]:
+def select_metrics(metrics_df: pd.DataFrame, metric_set: str, metric_scope: str) -> list[tuple[str, str, str]]:
+    regression_metrics, classification_metrics = metric_specs(metric_scope)
     if metric_set == "regression":
-        return REGRESSION_METRICS
+        return regression_metrics
     if metric_set == "classification":
-        return CLASSIFICATION_METRICS
+        return classification_metrics
 
     has_regression = any(
         col in metrics_df.columns and metrics_df[col].notna().any()
-        for col, _, _ in REGRESSION_METRICS
+        for col, _, _ in regression_metrics
     )
     has_classification = any(
         col in metrics_df.columns and metrics_df[col].notna().any()
-        for col, _, _ in CLASSIFICATION_METRICS
+        for col, _, _ in classification_metrics
     )
 
     if has_regression:
-        return REGRESSION_METRICS
+        return regression_metrics
     if has_classification:
-        return CLASSIFICATION_METRICS
+        return classification_metrics
     raise ValueError("No supported full-test metrics were found in the selected result groups.")
 
 
@@ -319,8 +339,13 @@ def main() -> None:
     if not group_dirs:
         raise ValueError("No result-group directories found.")
 
-    metrics_df = load_metrics(group_dirs, controls=controls, target_prefix=args.target_prefix)
-    selected_metrics = select_metrics(metrics_df, args.metric_set)
+    metrics_df = load_metrics(
+        group_dirs,
+        controls=controls,
+        target_prefix=args.target_prefix,
+        metric_scope=args.metric_scope,
+    )
+    selected_metrics = select_metrics(metrics_df, args.metric_set, args.metric_scope)
 
     for metric_col, metric_label, slug in selected_metrics:
         agg_df = aggregate_metrics(metrics_df, metric_col, column_mode=args.column_mode)
@@ -329,7 +354,7 @@ def main() -> None:
             metric_label=metric_label,
             output_path=output_dir / f"{slug}_layer_curves.png",
             column_mode=args.column_mode,
-            log_scale=(slug == "error"),
+            log_scale=("error" in slug),
         )
         agg_df.to_csv(output_dir / f"{slug}_layer_curves_summary.csv", index=False)
 
