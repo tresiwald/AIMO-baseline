@@ -840,6 +840,33 @@ def apply_classification_metrics(
     return metrics_row
 
 
+def expected_done_dirs(
+    results_dir: str,
+    target_col: str,
+    permutation_type: str,
+    control_task: str,
+    layer_idx: int,
+    model_name: str,
+    fold_idx: int,
+    seed: int,
+) -> list[Path]:
+    probe_name = f"{target_col}__{permutation_type}__{control_task.lower()}__L{layer_idx:03d}"
+    run_root = (
+        Path(results_dir)
+        / f"eval-adoption-{probe_name}"
+        / model_name.replace("/", "__")
+        / "full"
+        / control_task
+        / str(fold_idx)
+        / str(seed)
+        / "0"
+    )
+    return [
+        run_root / str(fold_idx) / "done",
+        run_root / "done",
+    ]
+
+
 def expected_done_dir(
     results_dir: str,
     target_col: str,
@@ -850,18 +877,28 @@ def expected_done_dir(
     fold_idx: int,
     seed: int,
 ) -> Path:
-    probe_name = f"{target_col}__{permutation_type}__{control_task.lower()}__L{layer_idx:03d}"
-    return (
-        Path(results_dir)
-        / f"eval-adoption-{probe_name}"
-        / model_name.replace("/", "__")
-        / "full"
-        / control_task
-        / str(fold_idx)
-        / str(seed)
-        / "0"
-        / "done"
-    )
+    for done_dir in expected_done_dirs(
+        results_dir=results_dir,
+        target_col=target_col,
+        permutation_type=permutation_type,
+        control_task=control_task,
+        layer_idx=layer_idx,
+        model_name=model_name,
+        fold_idx=fold_idx,
+        seed=seed,
+    ):
+        if (done_dir / "metrics.csv").exists() or (done_dir / "probe_artifact.npz").exists():
+            return done_dir
+    return expected_done_dirs(
+        results_dir=results_dir,
+        target_col=target_col,
+        permutation_type=permutation_type,
+        control_task=control_task,
+        layer_idx=layer_idx,
+        model_name=model_name,
+        fold_idx=fold_idx,
+        seed=seed,
+    )[0]
 
 
 def task_is_done(
@@ -874,17 +911,19 @@ def task_is_done(
     fold_idx: int,
     seed: int,
 ) -> bool:
-    done_dir = expected_done_dir(
-        results_dir=results_dir,
-        target_col=target_col,
-        permutation_type=permutation_type,
-        control_task=control_task,
-        layer_idx=layer_idx,
-        model_name=model_name,
-        fold_idx=fold_idx,
-        seed=seed,
+    return any(
+        (done_dir / "metrics.csv").exists()
+        for done_dir in expected_done_dirs(
+            results_dir=results_dir,
+            target_col=target_col,
+            permutation_type=permutation_type,
+            control_task=control_task,
+            layer_idx=layer_idx,
+            model_name=model_name,
+            fold_idx=fold_idx,
+            seed=seed,
+        )
     )
-    return (done_dir / "metrics.csv").exists()
 
 
 def standardize_splits(

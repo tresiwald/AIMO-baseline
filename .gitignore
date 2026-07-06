@@ -9,9 +9,6 @@ data/eval_adoption_internals_*/
 # Probe results
 results/
 
-# Cloned dependency — install via requirements.txt instructions
-holmes-evaluation/
-
 # Local memory
 memory/
 

@@ -42,8 +42,7 @@ bash scripts/setup_server.sh
 By default this installs the CUDA 12.1 PyTorch wheels, which are a safer match
 for older NVIDIA drivers than the latest CUDA wheels.
 
-For the trained-probe artifact workflow, including the local Holmes
-classification compatibility patch, use:
+For the trained-probe artifact workflow, including the Holmes submodule, use:
 
 ```bash
 bash scripts/setup_probe_artifact_env.sh

@@ -22,13 +22,15 @@ python -m pip install --upgrade pip setuptools wheel
 python -m pip install -r "$ROOT_DIR/requirements.txt"
 python -m pip install torch torchvision torchaudio --index-url "$TORCH_INDEX_URL"
 
-if [[ ! -d "$ROOT_DIR/holmes-evaluation/.git" ]]; then
-  git clone --branch "$HOLMES_BRANCH" "$HOLMES_REPO" "$ROOT_DIR/holmes-evaluation"
+if [[ -f "$ROOT_DIR/.gitmodules" ]] && git -C "$ROOT_DIR" config --file .gitmodules --get-regexp '^submodule\\.holmes-evaluation\\.' >/dev/null; then
+  git -C "$ROOT_DIR" submodule update --init --recursive holmes-evaluation
 else
-  echo "Holmes checkout already exists: $ROOT_DIR/holmes-evaluation"
+  if [[ ! -d "$ROOT_DIR/holmes-evaluation/.git" ]]; then
+    git clone --branch "$HOLMES_BRANCH" "$HOLMES_REPO" "$ROOT_DIR/holmes-evaluation"
+  else
+    echo "Holmes checkout already exists: $ROOT_DIR/holmes-evaluation"
+  fi
 fi
-
-python "$ROOT_DIR/scripts/patch_holmes_classification.py" "$ROOT_DIR/holmes-evaluation/core/model/probing_model.py"
 
 if [[ "$INSTALL_KERNEL" == "1" ]]; then
   python -m ipykernel install --user --name "$KERNEL_NAME" --display-name "$KERNEL_DISPLAY_NAME"
