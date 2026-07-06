@@ -58,10 +58,10 @@ pip install -r requirements.txt
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 ```
 
-If `holmes-evaluation` is missing:
+Initialize the Holmes submodule:
 
 ```bash
-git clone --branch probe_only https://github.com/Holmes-Benchmark/holmes-evaluation.git
+git submodule update --init --recursive holmes-evaluation
 ```
 
 ## Representation Encoding

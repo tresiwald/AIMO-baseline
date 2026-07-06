@@ -44,7 +44,9 @@ if [[ "$INSTALL_KERNEL" == "1" ]]; then
   python -m ipykernel install --user --name "$KERNEL_NAME" --display-name "$KERNEL_DISPLAY_NAME"
 fi
 
-if [[ ! -d "$ROOT_DIR/holmes-evaluation/.git" ]]; then
+if [[ -f "$ROOT_DIR/.gitmodules" ]] && git -C "$ROOT_DIR" config --file .gitmodules --get-regexp '^submodule\\.holmes-evaluation\\.' >/dev/null; then
+  git -C "$ROOT_DIR" submodule update --init --recursive holmes-evaluation
+elif [[ ! -d "$ROOT_DIR/holmes-evaluation/.git" ]]; then
   git clone --branch probe_only https://github.com/Holmes-Benchmark/holmes-evaluation.git "$ROOT_DIR/holmes-evaluation"
 fi
 
