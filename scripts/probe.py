@@ -28,6 +28,7 @@ import concurrent.futures
 import multiprocessing
 import os
 import random
+import re
 import sys
 from pathlib import Path
 
@@ -153,6 +154,36 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Threshold for converting regression predictions to binary labels. Use 'auto' to infer on the train split.",
     )
+    parser.add_argument(
+        "--dump-probe-artifacts",
+        action="store_true",
+        help="Write portable probe_artifact.npz files and assemble five-seed ensemble artifacts.",
+    )
+    parser.add_argument(
+        "--artifact-model-id",
+        default=None,
+        help="HF model id stored in exported probe artifacts. Defaults to --model-name.",
+    )
+    parser.add_argument(
+        "--artifact-system-prompt-path",
+        default=str(REPO_ROOT / "prompts" / "solve.txt"),
+        help="System prompt text file stored in exported probe artifacts.",
+    )
+    parser.add_argument(
+        "--layers",
+        default=None,
+        help="Optional comma-separated layer indices to run, e.g. '12' or '8,12,16'. Defaults to all layers.",
+    )
+    parser.add_argument(
+        "--permutation-types",
+        default=None,
+        help="Optional comma-separated permutation_type values to run. Defaults to all values in metadata.",
+    )
+    parser.add_argument(
+        "--control-tasks",
+        default=None,
+        help="Optional comma-separated Holmes control tasks to run from NONE,RANDOMIZATION. Defaults to both.",
+    )
     return parser.parse_args()
 
 
@@ -183,6 +214,20 @@ def parse_gamma_grid(raw: str) -> list[str | float]:
     if not values:
         raise ValueError("Expected at least one gamma value.")
     return values
+
+
+def parse_optional_str_list(raw: str | None) -> list[str] | None:
+    if raw is None:
+        return None
+    values = [chunk.strip() for chunk in raw.split(",") if chunk.strip()]
+    return values or None
+
+
+def parse_optional_layers(raw: str | None) -> list[int] | None:
+    values = parse_optional_str_list(raw)
+    if values is None:
+        return None
+    return [int(value) for value in values]
 
 
 def parse_threshold_arg(value: str) -> float | None:
@@ -414,6 +459,199 @@ def run_worker(worker: GeneralProbeWorker) -> tuple[str, pd.DataFrame, torch.nn.
         prediction_frame.to_csv(result_log_dir + "/preds.csv")
     worker.mark_run_as_done(logger=logger)
     return f"{logger.root_dir}/done", prediction_frame, probing_model
+
+
+def read_optional_text(path: str | None) -> str:
+    if not path:
+        return ""
+    prompt_path = Path(path)
+    if not prompt_path.exists():
+        raise FileNotFoundError(f"Artifact system prompt file not found: {prompt_path}")
+    return prompt_path.read_text().strip()
+
+
+def final_linear_layer(probing_model: torch.nn.Module) -> torch.nn.Linear:
+    for layer in reversed(list(probing_model.layers)):
+        if isinstance(layer, torch.nn.Linear):
+            return layer
+    raise ValueError("Could not find a final torch.nn.Linear layer in the probing model.")
+
+
+def read_metrics_row(done_dir: Path) -> dict[str, float | int | str]:
+    metrics_path = done_dir / "metrics.csv"
+    if not metrics_path.exists():
+        return {}
+    metrics_df = pd.read_csv(metrics_path)
+    if metrics_df.empty:
+        return {}
+    return metrics_df.iloc[-1].to_dict()
+
+
+def safe_artifact_stem(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("_") or "artifact"
+
+
+def export_probe_artifact(
+    probing_model: torch.nn.Module,
+    done_dir: Path,
+    layer_idx: int,
+    seed: int,
+    fold_idx: int,
+    permutation_type: str,
+    control_task: str,
+    model_id: str,
+    system_prompt: str,
+    target_col: str,
+    task_type: str,
+    threshold: float | None,
+) -> Path:
+    linear = final_linear_layer(probing_model)
+    weight = linear.weight.detach().cpu().float().numpy()
+    bias = linear.bias.detach().cpu().float().numpy() if linear.bias is not None else np.zeros(weight.shape[0], dtype=np.float32)
+    num_labels = int(probing_model.hyperparameter["num_labels"])
+
+    if num_labels == 2:
+        export_weights = (weight[1] - weight[0]).astype(np.float32)
+        export_bias = float(bias[1] - bias[0])
+        export_threshold = 0.0
+    elif num_labels == 1:
+        metrics_row = read_metrics_row(done_dir)
+        resolved_threshold = threshold
+        if resolved_threshold is None and "threshold" in metrics_row and pd.notna(metrics_row["threshold"]):
+            resolved_threshold = float(metrics_row["threshold"])
+        if resolved_threshold is None:
+            resolved_threshold = 0.0
+
+        # Regression threshold metrics define robust as prediction < threshold.
+        # The submission wrapper uses score >= threshold, so export the negated score.
+        export_weights = (-weight.reshape(-1)).astype(np.float32)
+        export_bias = float(-bias.reshape(-1)[0])
+        export_threshold = float(-resolved_threshold)
+    else:
+        raise ValueError("Portable probe export supports binary classification or scalar regression probes only.")
+
+    artifact_path = done_dir / "probe_artifact.npz"
+    np.savez(
+        artifact_path,
+        model_id=np.asarray(model_id),
+        layer_index=np.asarray(layer_idx, dtype=np.int64),
+        weights=export_weights,
+        bias=np.asarray(export_bias, dtype=np.float32),
+        threshold=np.asarray(export_threshold, dtype=np.float32),
+        seeds=np.asarray([seed], dtype=np.int64),
+        fold_index=np.asarray(fold_idx, dtype=np.int64),
+        permutation_type=np.asarray(permutation_type),
+        control_task=np.asarray(control_task),
+        ensemble_size=np.asarray(1, dtype=np.int64),
+        aggregation=np.asarray("mean_margin"),
+        system_prompt=np.asarray(system_prompt),
+        target_col=np.asarray(target_col),
+        task_type=np.asarray(task_type),
+    )
+    return artifact_path
+
+
+def npz_scalar(data: np.lib.npyio.NpzFile, key: str) -> str:
+    value = data[key]
+    if hasattr(value, "item"):
+        return str(value.item())
+    return str(value)
+
+
+def assemble_probe_ensemble_artifacts(
+    results_dir: str,
+    target_col: str,
+    permutation_types: list[str],
+    control_tasks: list[str],
+    layer_indices: list[int],
+    model_name: str,
+    seeds: list[int],
+    num_folds: int,
+) -> None:
+    output_dir = Path(results_dir) / "probe_artifacts"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    written = 0
+    skipped = 0
+
+    for permutation_type in permutation_types:
+        for control_task in control_tasks:
+            for layer_idx in layer_indices:
+                for fold_idx in range(num_folds):
+                    artifacts: list[tuple[int, Path]] = []
+                    for seed in seeds:
+                        artifact_path = (
+                            expected_done_dir(
+                                results_dir=results_dir,
+                                target_col=target_col,
+                                permutation_type=permutation_type,
+                                control_task=control_task,
+                                layer_idx=layer_idx,
+                                model_name=model_name,
+                                fold_idx=fold_idx,
+                                seed=seed,
+                            )
+                            / "probe_artifact.npz"
+                        )
+                        if artifact_path.exists():
+                            artifacts.append((seed, artifact_path))
+
+                    if len(artifacts) != len(seeds):
+                        skipped += 1
+                        continue
+
+                    weights = []
+                    biases = []
+                    thresholds = []
+                    model_id = None
+                    system_prompt = None
+                    task_type = None
+                    for seed, artifact_path in artifacts:
+                        with np.load(artifact_path, allow_pickle=False) as data:
+                            artifact_model_id = npz_scalar(data, "model_id")
+                            artifact_system_prompt = npz_scalar(data, "system_prompt")
+                            artifact_task_type = npz_scalar(data, "task_type")
+                            if model_id is None:
+                                model_id = artifact_model_id
+                                system_prompt = artifact_system_prompt
+                                task_type = artifact_task_type
+                            elif (
+                                model_id != artifact_model_id
+                                or system_prompt != artifact_system_prompt
+                                or task_type != artifact_task_type
+                            ):
+                                raise ValueError(f"Inconsistent metadata while assembling {artifact_path}")
+                            weights.append(np.asarray(data["weights"], dtype=np.float32).reshape(-1))
+                            biases.append(float(np.asarray(data["bias"]).reshape(-1)[0]))
+                            thresholds.append(float(np.asarray(data["threshold"]).reshape(-1)[0]))
+
+                    output_name = (
+                        f"{safe_artifact_stem(target_col)}__"
+                        f"{safe_artifact_stem(permutation_type)}__"
+                        f"{control_task.lower()}__L{layer_idx:03d}__fold{fold_idx:03d}.npz"
+                    )
+                    np.savez(
+                        output_dir / output_name,
+                        model_id=np.asarray(model_id),
+                        layer_index=np.asarray(layer_idx, dtype=np.int64),
+                        weights=np.stack(weights).astype(np.float32),
+                        bias=np.asarray(biases, dtype=np.float32),
+                        threshold=np.asarray(thresholds, dtype=np.float32),
+                        seeds=np.asarray(seeds, dtype=np.int64),
+                        fold_index=np.asarray(fold_idx, dtype=np.int64),
+                        permutation_type=np.asarray(permutation_type),
+                        control_task=np.asarray(control_task),
+                        ensemble_size=np.asarray(len(seeds), dtype=np.int64),
+                        aggregation=np.asarray("mean_margin"),
+                        system_prompt=np.asarray(system_prompt),
+                        target_col=np.asarray(target_col),
+                        task_type=np.asarray(task_type),
+                    )
+                    written += 1
+
+    print(
+        f"Assembled {written} five-seed ensemble artifact(s) in {output_dir}/"
+        + (f" ({skipped} group(s) incomplete)" if skipped else "")
+    )
 
 
 def evaluate_regression_dataset(
@@ -1005,6 +1243,9 @@ def run_layer(
     model_name: str,
     binary_eval_labels: np.ndarray | None = None,
     threshold: float | None = None,
+    dump_probe_artifacts: bool = False,
+    artifact_model_id: str | None = None,
+    artifact_system_prompt: str = "",
 ) -> None:
     train_ds, dev_ds, test_ds = make_fold_datasets(
         hidden_states,
@@ -1111,6 +1352,23 @@ def run_layer(
                 metrics_df.iloc[-1] = pd.Series(updated_row)
                 metrics_df.to_csv(metrics_path, index=False)
 
+    if dump_probe_artifacts and probing_model is not None:
+        artifact_path = export_probe_artifact(
+            probing_model=probing_model,
+            done_dir=Path(result_log_dir),
+            layer_idx=layer_idx,
+            seed=seed,
+            fold_idx=fold_idx,
+            permutation_type=permutation_type,
+            control_task=control_task,
+            model_id=artifact_model_id or model_name,
+            system_prompt=artifact_system_prompt,
+            target_col=target_col,
+            task_type=task_type,
+            threshold=threshold,
+        )
+        print(f"    wrote probe artifact: {artifact_path}")
+
 
 def run_probe_task(task: dict) -> dict:
     layer_states = np.load(task["internals_dir"] / task["layer_file"])
@@ -1163,6 +1421,9 @@ def run_probe_task(task: dict) -> dict:
             model_name=task["model_name"],
             binary_eval_labels=task["binary_eval_labels"],
             threshold=task["threshold"],
+            dump_probe_artifacts=task["dump_probe_artifacts"],
+            artifact_model_id=task["artifact_model_id"],
+            artifact_system_prompt=task["artifact_system_prompt"],
         )
     return {
         "permutation_type": task["permutation_type"],
@@ -1182,12 +1443,38 @@ def main() -> None:
     kernel_alphas = parse_float_grid(args.kernel_alphas)
     kernel_c_values = parse_float_grid(args.kernel_c_values)
     kernel_gammas = parse_gamma_grid(args.kernel_gammas)
+    artifact_model_id = args.artifact_model_id or args.model_name
+    artifact_system_prompt = read_optional_text(args.artifact_system_prompt_path) if args.dump_probe_artifacts else ""
+    selected_layers = parse_optional_layers(args.layers)
+    selected_permutation_types = parse_optional_str_list(args.permutation_types)
+    selected_control_tasks = parse_optional_str_list(args.control_tasks) or CONTROL_TASKS
+    invalid_control_tasks = sorted(set(selected_control_tasks).difference(CONTROL_TASKS))
+    if invalid_control_tasks:
+        raise ValueError(f"Unsupported control task(s): {invalid_control_tasks}. Expected values from {CONTROL_TASKS}.")
     metadata, layer_files = load_internals(internals_dir)
     if args.target_col not in metadata.columns:
         raise ValueError(
             f"Target column {args.target_col!r} not found in {internals_dir / 'metadata.csv'}"
         )
+    if selected_permutation_types is not None:
+        metadata = metadata[metadata["permutation_type"].isin(selected_permutation_types)].copy()
+        if metadata.empty:
+            raise ValueError(f"No rows matched --permutation-types {selected_permutation_types}.")
+    if selected_layers is not None:
+        selected_layer_set = set(selected_layers)
+        layer_files = [
+            layer_file
+            for layer_file in layer_files
+            if int(layer_file.replace("layer_", "").replace(".npy", "")) in selected_layer_set
+        ]
+        missing_layers = sorted(selected_layer_set.difference(
+            int(layer_file.replace("layer_", "").replace(".npy", "")) for layer_file in layer_files
+        ))
+        if missing_layers:
+            raise ValueError(f"Layer file(s) not found for --layers {missing_layers}.")
     n_layers = len(layer_files)
+    if n_layers == 0:
+        raise ValueError("No layer files selected.")
     task_type = infer_task_type(metadata[args.target_col])
     binary_eval_col = args.binary_eval_col.strip()
     use_binary_eval = False
@@ -1216,11 +1503,14 @@ def main() -> None:
     print(
         f"Running method={args.method} over {n_layers} layers across "
         f"{metadata['permutation_type'].nunique()} permutation types, "
-        f"{len(CONTROL_TASKS)} control settings, target={args.target_col}, task={task_type}, "
+        f"{len(selected_control_tasks)} control settings, target={args.target_col}, task={task_type}, "
         f"{len(seeds)} seeds, {args.num_folds} folds, and {args.num_workers} worker(s)"
     )
     if use_binary_eval:
         print(f"Threshold metrics enabled via binary label column {binary_eval_col!r} with threshold={args.threshold if args.threshold is not None else 'auto'}")
+
+    layer_indices = [int(layer_file.replace("layer_", "").replace(".npy", "")) for layer_file in layer_files]
+    permutation_types = sorted(str(value) for value in metadata["permutation_type"].dropna().unique().tolist())
 
     tasks: list[dict] = []
     skipped_done = 0
@@ -1259,7 +1549,7 @@ def main() -> None:
                     splitter = KFold(n_splits=args.num_folds, shuffle=True, random_state=seed)
                     split_iter = splitter.split(subset_indices)
                 for fold_idx, (train_pool_idx, test_idx) in enumerate(split_iter):
-                    for control_task in CONTROL_TASKS:
+                    for control_task in selected_control_tasks:
                         if task_is_done(
                             results_dir=args.results_dir,
                             target_col=args.target_col,
@@ -1301,6 +1591,9 @@ def main() -> None:
                                 "n_total_layers": n_layers,
                                 "results_dir": args.results_dir,
                                 "model_name": args.model_name,
+                                "dump_probe_artifacts": bool(args.dump_probe_artifacts and args.method == "probe"),
+                                "artifact_model_id": artifact_model_id,
+                                "artifact_system_prompt": artifact_system_prompt,
                             }
                         )
 
@@ -1319,6 +1612,18 @@ def main() -> None:
         ) as executor:
             for _ in executor.map(run_probe_task, tasks):
                 pass
+
+    if args.dump_probe_artifacts and args.method == "probe":
+        assemble_probe_ensemble_artifacts(
+            results_dir=args.results_dir,
+            target_col=args.target_col,
+            permutation_types=permutation_types,
+            control_tasks=selected_control_tasks,
+            layer_indices=layer_indices,
+            model_name=args.model_name,
+            seeds=seeds,
+            num_folds=args.num_folds,
+        )
 
     print(f"\nDone. Results saved to {args.results_dir}/")
 

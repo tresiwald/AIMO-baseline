@@ -125,6 +125,43 @@ python scripts/probe.py \
   --method probe
 ```
 
+To export submission-loadable trained probe weights, add
+`--dump-probe-artifacts` and store the Hugging Face model id used during
+encoding. With the default seed list this also assembles five-probe ensemble
+artifacts:
+
+```bash
+python scripts/probe.py \
+  --internals-dir data/eval_adoption_internals_table_filtered \
+  --results-dir results/eval_adoption_model_is_robust_probe_v1 \
+  --model-name deepseek-r1-0528-qwen3-8b \
+  --target-col model_is_robust \
+  --method probe \
+  --dump-probe-artifacts \
+  --artifact-model-id deepseek-ai/DeepSeek-R1-0528-Qwen3-8B
+```
+
+Each completed linear-probe run writes a single-seed `probe_artifact.npz` next
+to its `metrics.csv` and `preds.csv` inside the run's `done/` directory. After
+all runs finish, the script assembles complete seed groups into ensemble
+artifacts under `<results-dir>/probe_artifacts/`. Each ensemble artifact is a
+single `.npz` containing:
+
+- `model_id`: Hugging Face model id used to extract hidden states.
+- `layer_index`: integer hidden-state layer consumed by every probe.
+- `weights`: float32 array with shape `(5, hidden_dim)`.
+- `bias`: float32 array with shape `(5,)`.
+- `threshold`: float32 array with shape `(5,)`.
+- `seeds`: int64 array with the five training seeds.
+- `aggregation`: `mean_margin`, meaning the submission should compute
+  `scores = weights @ hidden_state + bias`, then return
+  `mean(scores - threshold) >= 0`.
+- `system_prompt`: prompt prefix used during encoding.
+
+Copy a selected ensemble artifact into the submission bundle as
+`solutions/trained-probe/probe_artifact.npz`, or place a model-specific copy at
+`solutions/trained-probe/probe_artifacts/<safe-model-id>.npz`.
+
 Kernel baseline:
 
 ```bash
