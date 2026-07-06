@@ -42,6 +42,13 @@ bash scripts/setup_server.sh
 By default this installs the CUDA 12.1 PyTorch wheels, which are a safer match
 for older NVIDIA drivers than the latest CUDA wheels.
 
+For the trained-probe artifact workflow, including the local Holmes
+classification compatibility patch, use:
+
+```bash
+bash scripts/setup_probe_artifact_env.sh
+```
+
 Manual setup:
 
 ```bash
@@ -127,8 +134,9 @@ python scripts/probe.py \
 
 To export submission-loadable trained probe weights, add
 `--dump-probe-artifacts` and store the Hugging Face model id used during
-encoding. With the default seed list this also assembles five-probe ensemble
-artifacts:
+encoding. With the default seed list this assembles one pickle artifact per
+fold/control/permutation containing every completed layer and all five seed
+probes:
 
 ```bash
 python scripts/probe.py \
@@ -141,26 +149,32 @@ python scripts/probe.py \
   --artifact-model-id deepseek-ai/DeepSeek-R1-0528-Qwen3-8B
 ```
 
-Each completed linear-probe run writes a single-seed `probe_artifact.npz` next
-to its `metrics.csv` and `preds.csv` inside the run's `done/` directory. After
-all runs finish, the script assembles complete seed groups into ensemble
-artifacts under `<results-dir>/probe_artifacts/`. Each ensemble artifact is a
-single `.npz` containing:
+Each completed linear-probe run writes an intermediate single-seed
+`probe_artifact.npz` next to its `metrics.csv` and `preds.csv` inside the run's
+`done/` directory. After all runs finish, the script assembles complete seed
+groups into pickle artifacts under `<results-dir>/probe_artifacts/`. Each final
+pickle is a dictionary containing:
 
 - `model_id`: Hugging Face model id used to extract hidden states.
-- `layer_index`: integer hidden-state layer consumed by every probe.
-- `weights`: float32 array with shape `(5, hidden_dim)`.
-- `bias`: float32 array with shape `(5,)`.
-- `threshold`: float32 array with shape `(5,)`.
-- `seeds`: int64 array with the five training seeds.
+- `layer_indices`: completed layer numbers included in the artifact.
+- `best_probe`: single highest-scoring probe by validation metric, including
+  layer, seed, metric, and score.
+- `best_layer_index`: layer number from `best_probe`.
+- `selection_metric`: metric used for layer selection.
+- `layer_scores`: mean validation score by layer across seeds.
+- `probe_scores`: validation score for every layer/seed probe.
+- `probes`: mapping from layer number to five seed probes. For each layer,
+  `weights` has shape `(5, hidden_dim)`, while `bias` and `threshold` have
+  shape `(5,)`.
+- `seeds`: the five training seeds.
 - `aggregation`: `mean_margin`, meaning the submission should compute
-  `scores = weights @ hidden_state + bias`, then return
+  `scores = probes[best_layer_index]["weights"] @ hidden_state + bias`, then return
   `mean(scores - threshold) >= 0`.
 - `system_prompt`: prompt prefix used during encoding.
 
-Copy a selected ensemble artifact into the submission bundle as
-`solutions/trained-probe/probe_artifact.npz`, or place a model-specific copy at
-`solutions/trained-probe/probe_artifacts/<safe-model-id>.npz`.
+Copy a selected pickle artifact into the submission bundle as
+`solutions/trained-probe/probe_artifact.pkl`, or place a model-specific copy at
+`solutions/trained-probe/probe_artifacts/<safe-model-id>.pkl`.
 
 Kernel baseline:
 

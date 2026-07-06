@@ -27,6 +27,7 @@ import argparse
 import concurrent.futures
 import multiprocessing
 import os
+import pickle
 import random
 import re
 import sys
@@ -157,7 +158,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dump-probe-artifacts",
         action="store_true",
-        help="Write portable probe_artifact.npz files and assemble five-seed ensemble artifacts.",
+        help="Write per-run probe_artifact.npz files and assemble layer/seed probe pickle artifacts.",
     )
     parser.add_argument(
         "--artifact-model-id",
@@ -558,7 +559,36 @@ def npz_scalar(data: np.lib.npyio.NpzFile, key: str) -> str:
     return str(value)
 
 
-def assemble_probe_ensemble_artifacts(
+def select_metric_from_row(metrics_row: dict[str, float | int | str], task_type: str) -> tuple[str, float] | None:
+    if task_type == "classification":
+        candidates = [
+            ("val balanced_acc", 1.0),
+            ("val f1", 1.0),
+            ("val acc", 1.0),
+            ("full test balanced_acc", 1.0),
+            ("full test f1", 1.0),
+            ("full test acc", 1.0),
+        ]
+    else:
+        candidates = [
+            ("val threshold_balanced_accuracy", 1.0),
+            ("val threshold_accuracy", 1.0),
+            ("val pearson", 1.0),
+            ("val error", -1.0),
+            ("val loss", -1.0),
+        ]
+
+    for column, multiplier in candidates:
+        if column not in metrics_row:
+            continue
+        value = pd.to_numeric(pd.Series([metrics_row[column]]), errors="coerce").iloc[0]
+        if pd.isna(value):
+            continue
+        return column, float(value) * multiplier
+    return None
+
+
+def assemble_probe_pickle_artifacts(
     results_dir: str,
     target_col: str,
     permutation_types: list[str],
@@ -571,12 +601,20 @@ def assemble_probe_ensemble_artifacts(
     output_dir = Path(results_dir) / "probe_artifacts"
     output_dir.mkdir(parents=True, exist_ok=True)
     written = 0
-    skipped = 0
+    skipped_folds = 0
+    skipped_layers = 0
 
     for permutation_type in permutation_types:
         for control_task in control_tasks:
-            for layer_idx in layer_indices:
-                for fold_idx in range(num_folds):
+            for fold_idx in range(num_folds):
+                probes_by_layer: dict[int, dict[str, np.ndarray | list[int]]] = {}
+                layer_scores: dict[int, float] = {}
+                layer_metric_names: dict[int, str] = {}
+                probe_scores: list[dict[str, float | int | str]] = []
+                model_id = None
+                system_prompt = None
+                task_type = None
+                for layer_idx in layer_indices:
                     artifacts: list[tuple[int, Path]] = []
                     for seed in seeds:
                         artifact_path = (
@@ -596,15 +634,14 @@ def assemble_probe_ensemble_artifacts(
                             artifacts.append((seed, artifact_path))
 
                     if len(artifacts) != len(seeds):
-                        skipped += 1
+                        skipped_layers += 1
                         continue
 
                     weights = []
                     biases = []
                     thresholds = []
-                    model_id = None
-                    system_prompt = None
-                    task_type = None
+                    metric_values = []
+                    metric_name = None
                     for seed, artifact_path in artifacts:
                         with np.load(artifact_path, allow_pickle=False) as data:
                             artifact_model_id = npz_scalar(data, "model_id")
@@ -624,33 +661,80 @@ def assemble_probe_ensemble_artifacts(
                             biases.append(float(np.asarray(data["bias"]).reshape(-1)[0]))
                             thresholds.append(float(np.asarray(data["threshold"]).reshape(-1)[0]))
 
-                    output_name = (
-                        f"{safe_artifact_stem(target_col)}__"
-                        f"{safe_artifact_stem(permutation_type)}__"
-                        f"{control_task.lower()}__L{layer_idx:03d}__fold{fold_idx:03d}.npz"
-                    )
-                    np.savez(
-                        output_dir / output_name,
-                        model_id=np.asarray(model_id),
-                        layer_index=np.asarray(layer_idx, dtype=np.int64),
-                        weights=np.stack(weights).astype(np.float32),
-                        bias=np.asarray(biases, dtype=np.float32),
-                        threshold=np.asarray(thresholds, dtype=np.float32),
-                        seeds=np.asarray(seeds, dtype=np.int64),
-                        fold_index=np.asarray(fold_idx, dtype=np.int64),
-                        permutation_type=np.asarray(permutation_type),
-                        control_task=np.asarray(control_task),
-                        ensemble_size=np.asarray(len(seeds), dtype=np.int64),
-                        aggregation=np.asarray("mean_margin"),
-                        system_prompt=np.asarray(system_prompt),
-                        target_col=np.asarray(target_col),
-                        task_type=np.asarray(task_type),
-                    )
-                    written += 1
+                        metrics = read_metrics_row(artifact_path.parent)
+                        selected_metric = select_metric_from_row(metrics, artifact_task_type)
+                        if selected_metric is not None:
+                            metric_name, metric_value = selected_metric
+                            metric_values.append(metric_value)
+                            probe_scores.append(
+                                {
+                                    "layer_index": int(layer_idx),
+                                    "seed": int(seed),
+                                    "metric": metric_name,
+                                    "score": float(metric_value),
+                                }
+                            )
+
+                    probes_by_layer[layer_idx] = {
+                        "weights": np.stack(weights).astype(np.float32),
+                        "bias": np.asarray(biases, dtype=np.float32),
+                        "threshold": np.asarray(thresholds, dtype=np.float32),
+                        "seeds": list(seeds),
+                    }
+                    if metric_values:
+                        layer_scores[layer_idx] = float(np.mean(metric_values))
+                        if metric_name is not None:
+                            layer_metric_names[layer_idx] = metric_name
+
+                if not probes_by_layer:
+                    skipped_folds += 1
+                    continue
+
+                if probe_scores:
+                    best_probe = max(probe_scores, key=lambda item: float(item["score"]))
+                    best_layer_idx = int(best_probe["layer_index"])
+                    selection_metric = str(best_probe["metric"])
+                else:
+                    best_probe = None
+                    best_layer_idx = sorted(probes_by_layer)[0]
+                    selection_metric = "unavailable"
+
+                output_name = (
+                    f"{safe_artifact_stem(target_col)}__"
+                    f"{safe_artifact_stem(permutation_type)}__"
+                    f"{control_task.lower()}__fold{fold_idx:03d}.pkl"
+                )
+                artifact = {
+                    "schema_version": 1,
+                    "artifact_type": "layer_seed_probe_ensemble",
+                    "model_id": model_id,
+                    "system_prompt": system_prompt,
+                    "target_col": target_col,
+                    "task_type": task_type,
+                    "permutation_type": permutation_type,
+                    "control_task": control_task,
+                    "fold_index": fold_idx,
+                    "seeds": list(seeds),
+                    "layer_indices": sorted(probes_by_layer),
+                    "best_layer_index": int(best_layer_idx),
+                    "best_probe": best_probe,
+                    "selection_metric": selection_metric,
+                    "layer_scores": layer_scores,
+                    "probe_scores": probe_scores,
+                    "aggregation": "mean_margin",
+                    "probes": probes_by_layer,
+                }
+                with (output_dir / output_name).open("wb") as handle:
+                    pickle.dump(artifact, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                written += 1
 
     print(
-        f"Assembled {written} five-seed ensemble artifact(s) in {output_dir}/"
-        + (f" ({skipped} group(s) incomplete)" if skipped else "")
+        f"Assembled {written} layer/seed probe pickle artifact(s) in {output_dir}/"
+        + (
+            f" ({skipped_layers} incomplete layer group(s), {skipped_folds} empty fold group(s) skipped)"
+            if skipped_layers or skipped_folds
+            else ""
+        )
     )
 
 
@@ -1614,7 +1698,7 @@ def main() -> None:
                 pass
 
     if args.dump_probe_artifacts and args.method == "probe":
-        assemble_probe_ensemble_artifacts(
+        assemble_probe_pickle_artifacts(
             results_dir=args.results_dir,
             target_col=args.target_col,
             permutation_types=permutation_types,
