@@ -535,6 +535,7 @@ def export_probe_artifact(
     np.savez(
         artifact_path,
         model_id=np.asarray(model_id),
+        hf_model_id=np.asarray(model_id),
         layer_index=np.asarray(layer_idx, dtype=np.int64),
         weights=export_weights,
         bias=np.asarray(export_bias, dtype=np.float32),
@@ -660,7 +661,7 @@ def assemble_probe_pickle_artifacts(
                     metric_name = None
                     for seed, artifact_path in artifacts:
                         with np.load(artifact_path, allow_pickle=False) as data:
-                            artifact_model_id = npz_scalar(data, "model_id")
+                            artifact_model_id = npz_scalar(data, "hf_model_id" if "hf_model_id" in data else "model_id")
                             artifact_system_prompt = npz_scalar(data, "system_prompt")
                             artifact_task_type = npz_scalar(data, "task_type")
                             if model_id is None:
@@ -773,6 +774,7 @@ def assemble_probe_pickle_artifacts(
         "schema_version": 2,
         "artifact_type": "all_folds_layers_seed_probe_ensemble",
         "model_id": model_id,
+        "hf_model_id": model_id,
         "system_prompt": system_prompt,
         "target_col": target_col,
         "task_type": task_type,

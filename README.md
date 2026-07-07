@@ -105,6 +105,7 @@ layer:
 
 - `best_layer_index`: globally selected layer across validation metrics
 - `best_probe`: permutation type, control task, fold, layer, seed, metric, and score
+- `hf_model_id`: Hugging Face model id used to encode the representations
 - `groups`: one entry per `(permutation_type, control_task, fold)`
 - `groups[*]["probes"][layer]["weights"]`: nested list with shape `(5, hidden_dim)` for the default five seeds
 - `groups[*]["probes"][layer]["bias"]`: list with shape `(5,)`
