@@ -559,6 +559,20 @@ def npz_scalar(data: np.lib.npyio.NpzFile, key: str) -> str:
     return str(value)
 
 
+def pickle_safe_value(value):
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {pickle_safe_value(key): pickle_safe_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [pickle_safe_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(pickle_safe_value(item) for item in value)
+    return value
+
+
 def select_metric_from_row(metrics_row: dict[str, float | int | str], task_type: str) -> tuple[str, float] | None:
     if task_type == "classification":
         candidates = [
@@ -792,7 +806,7 @@ def assemble_probe_pickle_artifacts(
     }
     output_path = output_dir / "probe_artifact.pkl"
     with output_path.open("wb") as handle:
-        pickle.dump(artifact, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        pickle.dump(pickle_safe_value(artifact), handle, protocol=pickle.HIGHEST_PROTOCOL)
 
     print(
         f"Assembled 1 layer/seed/fold probe pickle artifact: {output_path}"

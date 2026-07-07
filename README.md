@@ -106,9 +106,9 @@ layer:
 - `best_layer_index`: globally selected layer across validation metrics
 - `best_probe`: permutation type, control task, fold, layer, seed, metric, and score
 - `groups`: one entry per `(permutation_type, control_task, fold)`
-- `groups[*]["probes"][layer]["weights"]`: shape `(5, hidden_dim)` for the default five seeds
-- `groups[*]["probes"][layer]["bias"]`: shape `(5,)`
-- `groups[*]["probes"][layer]["threshold"]`: shape `(5,)`
+- `groups[*]["probes"][layer]["weights"]`: nested list with shape `(5, hidden_dim)` for the default five seeds
+- `groups[*]["probes"][layer]["bias"]`: list with shape `(5,)`
+- `groups[*]["probes"][layer]["threshold"]`: list with shape `(5,)`
 - `recommended_strategy`: `best_layer_mean_margin`
 - `alternative_strategy`: `all_layers_mean_margin`
 - `aggregation`: `mean_margin`
@@ -118,6 +118,8 @@ The submission should use the recommended strategy by default: load
 every stored seed/fold probe margin for that layer, and return
 `mean(scores - threshold) >= 0`. The pickle also keeps all layer probes so the
 submission can switch to an all-layer mean-margin ensemble without retraining.
+Probe arrays are stored as plain Python lists for NumPy-version-portable pickle
+loading; convert them with `np.asarray(...)` before scoring.
 
 ## Direct Commands
 
