@@ -51,7 +51,11 @@ while IFS= read -r INTERNALS_DIR; do
   VIEW_NAME="$(basename "$INTERNALS_DIR")"
 
   for METHOD in "${METHOD_LIST[@]}"; do
-    METHOD="$(echo "$METHOD" | xargs)"
+    METHOD="${METHOD#"${METHOD%%[![:space:]]*}"}"
+    METHOD="${METHOD%"${METHOD##*[![:space:]]}"}"
+    if [[ -z "$METHOD" ]]; then
+      continue
+    fi
     RESULT_DIR="$RESULTS_ROOT/eval_adoption_${TARGET_SLUG}_${MODEL_SLUG}_${VIEW_NAME}_${METHOD}"
     if [[ "$REDUCED_DIM" -gt 0 ]]; then
       RESULT_DIR="${RESULT_DIR}_pca${REDUCED_DIM}"

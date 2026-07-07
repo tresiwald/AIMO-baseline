@@ -199,7 +199,7 @@ Example override:
 INTERNALS_ROOT=data/eval_adoption_internals_table_filtered \
 MODEL_NAME=deepseek-r1-0528-qwen3-8b \
 TARGET_COL=absolute_accuracy_decay \
-METHODS=probe,kernel \
+METHODS=probe \
 bash run_probing.bash
 ```
 
