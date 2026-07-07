@@ -94,24 +94,30 @@ NUM_WORKERS=1 \
 bash run_probing.bash
 ```
 
-Final artifacts are written to:
+The final artifact is written to:
 
 ```text
-results/<run-name>/probe_artifacts/*.pkl
+results/<run-name>/probe_artifacts/probe_artifact.pkl
 ```
 
-Each pickle contains:
+The pickle contains all exported probes for every completed seed, fold, and
+layer:
 
-- `best_layer_index`: layer selected from the best validation probe
-- `best_probe`: layer, seed, metric, and score
-- `probes[layer]["weights"]`: shape `(5, hidden_dim)` for the default five seeds
-- `probes[layer]["bias"]`: shape `(5,)`
-- `probes[layer]["threshold"]`: shape `(5,)`
+- `best_layer_index`: globally selected layer across validation metrics
+- `best_probe`: permutation type, control task, fold, layer, seed, metric, and score
+- `groups`: one entry per `(permutation_type, control_task, fold)`
+- `groups[*]["probes"][layer]["weights"]`: shape `(5, hidden_dim)` for the default five seeds
+- `groups[*]["probes"][layer]["bias"]`: shape `(5,)`
+- `groups[*]["probes"][layer]["threshold"]`: shape `(5,)`
+- `recommended_strategy`: `best_layer_mean_margin`
+- `alternative_strategy`: `all_layers_mean_margin`
 - `aggregation`: `mean_margin`
 
-The submission should load `best_layer_index`, encode that layer's final
-input-token hidden state, compute all five probe scores, and return
-`mean(scores - threshold) >= 0`.
+The submission should use the recommended strategy by default: load
+`best_layer_index`, encode that layer's final input-token hidden state, compute
+every stored seed/fold probe margin for that layer, and return
+`mean(scores - threshold) >= 0`. The pickle also keeps all layer probes so the
+submission can switch to an all-layer mean-margin ensemble without retraining.
 
 ## Direct Commands
 

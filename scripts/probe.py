@@ -600,9 +600,14 @@ def assemble_probe_pickle_artifacts(
 ) -> None:
     output_dir = Path(results_dir) / "probe_artifacts"
     output_dir.mkdir(parents=True, exist_ok=True)
-    written = 0
     skipped_folds = 0
     skipped_layers = 0
+    groups = []
+    all_probe_scores: list[dict[str, float | int | str]] = []
+    all_layer_metric_values: dict[int, list[float]] = {}
+    model_id = None
+    system_prompt = None
+    task_type = None
 
     for permutation_type in permutation_types:
         for control_task in control_tasks:
@@ -611,9 +616,6 @@ def assemble_probe_pickle_artifacts(
                 layer_scores: dict[int, float] = {}
                 layer_metric_names: dict[int, str] = {}
                 probe_scores: list[dict[str, float | int | str]] = []
-                model_id = None
-                system_prompt = None
-                task_type = None
                 for layer_idx in layer_indices:
                     artifacts: list[tuple[int, Path]] = []
                     for seed in seeds:
@@ -674,6 +676,18 @@ def assemble_probe_pickle_artifacts(
                                     "score": float(metric_value),
                                 }
                             )
+                            all_probe_scores.append(
+                                {
+                                    "permutation_type": permutation_type,
+                                    "control_task": control_task,
+                                    "fold_index": int(fold_idx),
+                                    "layer_index": int(layer_idx),
+                                    "seed": int(seed),
+                                    "metric": metric_name,
+                                    "score": float(metric_value),
+                                }
+                            )
+                            all_layer_metric_values.setdefault(layer_idx, []).append(float(metric_value))
 
                     probes_by_layer[layer_idx] = {
                         "weights": np.stack(weights).astype(np.float32),
@@ -699,37 +713,89 @@ def assemble_probe_pickle_artifacts(
                     best_layer_idx = sorted(probes_by_layer)[0]
                     selection_metric = "unavailable"
 
-                output_name = (
-                    f"{safe_artifact_stem(target_col)}__"
-                    f"{safe_artifact_stem(permutation_type)}__"
-                    f"{control_task.lower()}__fold{fold_idx:03d}.pkl"
+                groups.append(
+                    {
+                        "permutation_type": permutation_type,
+                        "control_task": control_task,
+                        "fold_index": fold_idx,
+                        "seeds": list(seeds),
+                        "layer_indices": sorted(probes_by_layer),
+                        "best_layer_index": int(best_layer_idx),
+                        "best_probe": best_probe,
+                        "selection_metric": selection_metric,
+                        "layer_scores": layer_scores,
+                        "probe_scores": probe_scores,
+                        "aggregation": "mean_margin",
+                        "probes": probes_by_layer,
+                    }
                 )
-                artifact = {
-                    "schema_version": 1,
-                    "artifact_type": "layer_seed_probe_ensemble",
-                    "model_id": model_id,
-                    "system_prompt": system_prompt,
-                    "target_col": target_col,
-                    "task_type": task_type,
-                    "permutation_type": permutation_type,
-                    "control_task": control_task,
-                    "fold_index": fold_idx,
-                    "seeds": list(seeds),
-                    "layer_indices": sorted(probes_by_layer),
-                    "best_layer_index": int(best_layer_idx),
-                    "best_probe": best_probe,
-                    "selection_metric": selection_metric,
-                    "layer_scores": layer_scores,
-                    "probe_scores": probe_scores,
-                    "aggregation": "mean_margin",
-                    "probes": probes_by_layer,
-                }
-                with (output_dir / output_name).open("wb") as handle:
-                    pickle.dump(artifact, handle, protocol=pickle.HIGHEST_PROTOCOL)
-                written += 1
+
+    if not groups:
+        print(
+            f"Assembled 0 layer/seed probe pickle artifact(s) in {output_dir}/"
+            + (
+                f" ({skipped_layers} incomplete layer group(s), {skipped_folds} empty fold group(s) skipped)"
+                if skipped_layers or skipped_folds
+                else ""
+            )
+        )
+        return
+
+    layer_scores = {
+        int(layer_idx): float(np.mean(metric_values))
+        for layer_idx, metric_values in sorted(all_layer_metric_values.items())
+        if metric_values
+    }
+    if layer_scores:
+        best_layer_idx = max(layer_scores, key=layer_scores.get)
+        best_probe = max(all_probe_scores, key=lambda item: float(item["score"])) if all_probe_scores else None
+        selection_metric = str(best_probe["metric"]) if best_probe is not None else "mean_validation_metric"
+    else:
+        best_layer_idx = sorted({layer for group in groups for layer in group["layer_indices"]})[0]
+        best_probe = None
+        selection_metric = "unavailable"
+
+    artifact = {
+        "schema_version": 2,
+        "artifact_type": "all_folds_layers_seed_probe_ensemble",
+        "model_id": model_id,
+        "system_prompt": system_prompt,
+        "target_col": target_col,
+        "task_type": task_type,
+        "seeds": list(seeds),
+        "fold_indices": sorted({int(group["fold_index"]) for group in groups}),
+        "layer_indices": sorted({int(layer) for group in groups for layer in group["layer_indices"]}),
+        "permutation_types": sorted({str(group["permutation_type"]) for group in groups}),
+        "control_tasks": sorted({str(group["control_task"]) for group in groups}),
+        "best_layer_index": int(best_layer_idx),
+        "best_probe": best_probe,
+        "selection_metric": selection_metric,
+        "layer_scores": layer_scores,
+        "probe_scores": all_probe_scores,
+        "recommended_strategy": {
+            "name": "best_layer_mean_margin",
+            "layer_index": int(best_layer_idx),
+            "description": (
+                "At inference, encode best_layer_index and average score-threshold "
+                "margins across every stored seed/fold probe for that layer."
+            ),
+        },
+        "alternative_strategy": {
+            "name": "all_layers_mean_margin",
+            "description": (
+                "Average margins across every stored seed/fold/layer probe. This is "
+                "available from the same groups data but is not the default."
+            ),
+        },
+        "aggregation": "mean_margin",
+        "groups": groups,
+    }
+    output_path = output_dir / "probe_artifact.pkl"
+    with output_path.open("wb") as handle:
+        pickle.dump(artifact, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
     print(
-        f"Assembled {written} layer/seed probe pickle artifact(s) in {output_dir}/"
+        f"Assembled 1 layer/seed/fold probe pickle artifact: {output_path}"
         + (
             f" ({skipped_layers} incomplete layer group(s), {skipped_folds} empty fold group(s) skipped)"
             if skipped_layers or skipped_folds
