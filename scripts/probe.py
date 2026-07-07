@@ -816,7 +816,12 @@ def evaluate_regression_dataset(
 
     probing_model.eval()
     with torch.no_grad():
-        for x, y, seen_indices in dataloader:
+        for batch in dataloader:
+            if len(batch) == 3:
+                x, y, seen_indices = batch
+            else:
+                x, y = batch
+                seen_indices = torch.zeros(len(y), dtype=torch.bool)
             x = x.to(probing_model.device)
             y = y.to(probing_model.device)
             pred = probing_model(x).squeeze(1)
@@ -857,7 +862,12 @@ def evaluate_classification_dataset(
 
     probing_model.eval()
     with torch.no_grad():
-        for x, y, seen_indices in dataloader:
+        for batch in dataloader:
+            if len(batch) == 3:
+                x, y, seen_indices = batch
+            else:
+                x, y = batch
+                seen_indices = torch.zeros(len(y), dtype=torch.bool)
             x = x.to(probing_model.device)
             y = y.to(probing_model.device)
             logits = probing_model(x)
