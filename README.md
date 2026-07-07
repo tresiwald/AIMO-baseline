@@ -42,9 +42,9 @@ The encoder runs the model once per unique `original_problem` and saves every
 layer's final input-token hidden state.
 
 ```bash
-MODEL_ID=Qwen/Qwen2.5-0.5B-Instruct \
+MODEL_ID=deepseek-ai/DeepSeek-R1-0528-Qwen3-8B \
 DATASET_CSV=data/math-robust-final.csv \
-OUTPUT_DIR=data/eval_adoption_internals_qwen0_5b_math \
+OUTPUT_DIR=data/eval_adoption_internals_table_filtered \
 DEVICE=auto \
 bash run_encoding.bash
 ```
@@ -61,9 +61,9 @@ The output directory contains:
 Run linear probes on the encoded representations:
 
 ```bash
-INTERNALS_ROOT=data/eval_adoption_internals_qwen0_5b_math \
-MODEL_NAME=qwen2.5-0.5b-instruct \
-TARGET_COL=model_is_robust \
+INTERNALS_ROOT=data/eval_adoption_internals_table_filtered \
+MODEL_NAME=deepseek-r1-0528-qwen3-8b \
+TARGET_COL=absolute_accuracy_decay \
 NUM_WORKERS=1 \
 bash run_probing.bash
 ```
@@ -85,11 +85,11 @@ To export a pickle artifact for the submission bundle, enable artifact dumping
 and provide the Hugging Face model id used during encoding:
 
 ```bash
-INTERNALS_ROOT=data/eval_adoption_internals_qwen0_5b_math \
-MODEL_NAME=qwen2.5-0.5b-instruct \
-TARGET_COL=model_is_robust \
+INTERNALS_ROOT=data/eval_adoption_internals_table_filtered \
+MODEL_NAME=deepseek-r1-0528-qwen3-8b \
+TARGET_COL=absolute_accuracy_decay \
 DUMP_PROBE_ARTIFACTS=1 \
-ARTIFACT_MODEL_ID=Qwen/Qwen2.5-0.5B-Instruct \
+ARTIFACT_MODEL_ID=deepseek-ai/DeepSeek-R1-0528-Qwen3-8B \
 NUM_WORKERS=1 \
 bash run_probing.bash
 ```
