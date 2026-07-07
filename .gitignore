@@ -1,6 +1,7 @@
 .DS_Store
 __pycache__/
 *.pyc
+.~lock.*
 
 # Generated internals (large numpy arrays)
 data/internals/
@@ -8,6 +9,7 @@ data/eval_adoption_internals_*/
 
 # Probe results
 results/
+plots/
 
 # Local memory
 memory/
