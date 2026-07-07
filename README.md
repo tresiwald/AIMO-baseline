@@ -1,101 +1,51 @@
-<h1 align="center">AIMO Interpretability Challenge - Baselines</h1>
+# AIMO Baseline: Encode, Probe, Export
 
-<div style="text-align: center; width: 100%;">
-  <div style="display: inline-block; text-align: left; width: 100%;">
-    <img src="assets/imgs/aimo_interp_challenge.png" style="width: 100%;" alt="Challenge theme">
-    <p style="color: gray; font-size: small; margin: 0;">
-    </p>
-  </div>
-</div>
+This repository contains the representation-probe baseline for the AIMO
+Interpretability Challenge. The intended workflow is deliberately small:
 
-<br>
-
-This repository contains baselines for the AIMO Interpretability Challenge 2026.
-
-*The AIMO Interpretability Challenge is a competition on distinguishing robust from spurious reasoning in frontier mathematical language models. The challenge is motivated by a central limitation of standard reasoning benchmarks: strong final-answer accuracy does not reveal whether a model genuinely relies on stable reasoning mechanisms or exploits brittle shortcuts. Building on the AI Mathematical Olympiad (AIMO) submissions and the Fields Model Initiative’s resources, the competition will provide (1) olympiad-level math problems, (2) their symbolic representations allowing generation of counterfactual variants, (3) access to best-performing AIMO models, and (4) a generous compute of up to 128 H200 GPUs. Based on these, participants will develop methods that identify which model is robust, using models’ internal representations. Our competition will also create a new, open robustness benchmark and baseline systems, aiming to provide a lasting infrastructure for standard benchmarking in interpretability. Scientifically, the competition bridges the gap between the fields of interpretability and generalization by aligning their objectives, while lastingly supporting work aiming to answer the pertaining question in AI research: can we tell if, and to what extent, is the decision making of frontier AI models generalizable, and thus, reliable?*
-
-The current codebase focuses on a minimal representation-based workflow:
-
-- encode the last input-token hidden state from every transformer layer
-- predict `absolute_accuracy_decay` from those layer representations
-- compare linear probing and kernel baselines
-
-## Table of Contents
-- [Table of Contents](#table-of-contents)
-- [Setup](#setup)
-- [Representation Encoding](#representation-encoding)
-- [Layer-wise Prediction](#layer-wise-prediction)
-- [Plotting](#plotting)
-- [License](#license)
-- [Citation](#citation)
+1. Set up the Python environment and Holmes submodule.
+2. Encode final input-token hidden states for each dataset row.
+3. Train linear probes across layers and seeds.
+4. Optionally export a submission artifact with the trained probes.
 
 ## Setup
 
-All code was developed and tested in a Python virtual environment with the dependencies listed in [requirements.txt](/Users/tresi/Projects/AIMO-baseline/requirements.txt).
-
-For a server-style setup, use:
-
-```bash
-bash scripts/setup_server.sh
-```
-
-By default this installs the CUDA 12.1 PyTorch wheels, which are a safer match
-for older NVIDIA drivers than the latest CUDA wheels.
-
-For the trained-probe artifact workflow, including the Holmes submodule, use:
-
-```bash
-bash scripts/setup_probe_artifact_env.sh
-```
-
-Manual setup:
-
-```bash
-python3 -m venv .venv-jlab
-source .venv-jlab/bin/activate
-pip install --upgrade pip setuptools wheel
-pip install -r requirements.txt
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-```
-
-Initialize the Holmes submodule:
+Clone with submodules, or initialize the submodule after cloning:
 
 ```bash
 git submodule update --init --recursive holmes-evaluation
 ```
 
-## Representation Encoding
-
-The encoding stage performs a single forward pass per unique prompt and extracts only the final input-token hidden state from every layer. Duplicate prompts are encoded once and then expanded back to the full dataset rows.
-
-Expected CSV columns:
-
-- `problem_id`
-- `original_problem`
-- `permutation_type`
-- `absolute_accuracy_decay`
-
-Direct run:
+Create the environment:
 
 ```bash
-python scripts/encode.py \
-  --dataset-csv data/math-robust-final.csv \
-  --model-id deepseek-ai/DeepSeek-R1-0528-Qwen3-8B \
-  --output-dir data/eval_adoption_internals_table_filtered \
-  --device cuda
+bash scripts/setup_probe_artifact_env.sh
 ```
 
-Wrapper:
+By default this creates `.venv-jlab` and installs CUDA 12.1 PyTorch wheels. For
+CPU-only PyTorch:
 
 ```bash
-bash run_encoding.bash
+TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu \
+bash scripts/setup_probe_artifact_env.sh
 ```
 
-Example override:
+Activate the environment:
 
 ```bash
+source .venv-jlab/bin/activate
+```
+
+## Encode Representations
+
+The encoder runs the model once per unique `original_problem` and saves every
+layer's final input-token hidden state.
+
+```bash
+MODEL_ID=Qwen/Qwen2.5-0.5B-Instruct \
 DATASET_CSV=data/math-robust-final.csv \
-OUTPUT_DIR=data/eval_adoption_internals_table_filtered \
+OUTPUT_DIR=data/eval_adoption_internals_qwen0_5b_math \
+DEVICE=auto \
 bash run_encoding.bash
 ```
 
@@ -106,156 +56,71 @@ The output directory contains:
 - `layer_001.npy`
 - ...
 
-## Layer-wise Prediction
+## Train Probes
 
-The probing stage runs repeated cross-validation over layers and perturbation types using two methods:
-
-- `probe`: linear predictive baseline
-- `kernel`: kernel baseline
-
-Default sweep settings:
-
-- controls: `NONE`, `RANDOMIZATION`
-- seeds: `42,43,44,45,46`
-- folds: `4`
-- workers: CPU core count
-
-Linear probe:
+Run linear probes on the encoded representations:
 
 ```bash
-python scripts/probe.py \
-  --internals-dir data/eval_adoption_internals_table_filtered \
-  --results-dir results/eval_adoption_absolute_accuracy_decay_probe_v1 \
-  --model-name deepseek-r1-0528-qwen3-8b \
-  --target-col absolute_accuracy_decay \
-  --method probe
-```
-
-To export submission-loadable trained probe weights, add
-`--dump-probe-artifacts` and store the Hugging Face model id used during
-encoding. With the default seed list this assembles one pickle artifact per
-fold/control/permutation containing every completed layer and all five seed
-probes:
-
-```bash
-python scripts/probe.py \
-  --internals-dir data/eval_adoption_internals_table_filtered \
-  --results-dir results/eval_adoption_model_is_robust_probe_v1 \
-  --model-name deepseek-r1-0528-qwen3-8b \
-  --target-col model_is_robust \
-  --method probe \
-  --dump-probe-artifacts \
-  --artifact-model-id deepseek-ai/DeepSeek-R1-0528-Qwen3-8B
-```
-
-Each completed linear-probe run writes an intermediate single-seed
-`probe_artifact.npz` next to its `metrics.csv` and `preds.csv` inside the run's
-`done/` directory. After all runs finish, the script assembles complete seed
-groups into pickle artifacts under `<results-dir>/probe_artifacts/`. Each final
-pickle is a dictionary containing:
-
-- `model_id`: Hugging Face model id used to extract hidden states.
-- `layer_indices`: completed layer numbers included in the artifact.
-- `best_probe`: single highest-scoring probe by validation metric, including
-  layer, seed, metric, and score.
-- `best_layer_index`: layer number from `best_probe`.
-- `selection_metric`: metric used for layer selection.
-- `layer_scores`: mean validation score by layer across seeds.
-- `probe_scores`: validation score for every layer/seed probe.
-- `probes`: mapping from layer number to five seed probes. For each layer,
-  `weights` has shape `(5, hidden_dim)`, while `bias` and `threshold` have
-  shape `(5,)`.
-- `seeds`: the five training seeds.
-- `aggregation`: `mean_margin`, meaning the submission should compute
-  `scores = probes[best_layer_index]["weights"] @ hidden_state + bias`, then return
-  `mean(scores - threshold) >= 0`.
-- `system_prompt`: prompt prefix used during encoding.
-
-Copy a selected pickle artifact into the submission bundle as
-`solutions/trained-probe/probe_artifact.pkl`, or place a model-specific copy at
-`solutions/trained-probe/probe_artifacts/<safe-model-id>.pkl`.
-
-Kernel baseline:
-
-```bash
-python scripts/probe.py \
-  --internals-dir data/eval_adoption_internals_table_filtered \
-  --results-dir results/eval_adoption_absolute_accuracy_decay_kernel_v1 \
-  --model-name deepseek-r1-0528-qwen3-8b \
-  --target-col absolute_accuracy_decay \
-  --method kernel \
-  --kernel rbf
-```
-
-Wrapper:
-
-```bash
+INTERNALS_ROOT=data/eval_adoption_internals_qwen0_5b_math \
+MODEL_NAME=qwen2.5-0.5b-instruct \
+TARGET_COL=model_is_robust \
+NUM_WORKERS=1 \
 bash run_probing.bash
 ```
 
-Example override:
+Useful optional limits for quick tests:
 
 ```bash
-INTERNALS_ROOT=data/eval_adoption_internals_table_filtered \
-MODEL_NAME=deepseek-r1-0528-qwen3-8b \
-TARGET_COL=absolute_accuracy_decay \
-METHODS=probe \
+LAYERS=12 \
+PERMUTATION_TYPES=domain \
+CONTROL_TASKS=NONE \
+SEEDS=42,43,44,45,46 \
+NUM_FOLDS=2 \
 bash run_probing.bash
 ```
 
-PCA is optional and fit only on the training pool of each split:
+## Export Probe Artifact
+
+To export a pickle artifact for the submission bundle, enable artifact dumping
+and provide the Hugging Face model id used during encoding:
 
 ```bash
-python scripts/probe.py \
-  --internals-dir data/eval_adoption_internals_table_filtered \
-  --results-dir results/eval_adoption_absolute_accuracy_decay_kernel_pca10_v1 \
-  --model-name deepseek-r1-0528-qwen3-8b \
-  --target-col absolute_accuracy_decay \
-  --method kernel \
-  --reduced-dim 10
+INTERNALS_ROOT=data/eval_adoption_internals_qwen0_5b_math \
+MODEL_NAME=qwen2.5-0.5b-instruct \
+TARGET_COL=model_is_robust \
+DUMP_PROBE_ARTIFACTS=1 \
+ARTIFACT_MODEL_ID=Qwen/Qwen2.5-0.5B-Instruct \
+NUM_WORKERS=1 \
+bash run_probing.bash
 ```
 
-The runner skips already completed tasks individually whenever the corresponding `done/metrics.csv` already exists.
+Final artifacts are written to:
 
-## Plotting
+```text
+results/<run-name>/probe_artifacts/*.pkl
+```
 
-Layer curves:
+Each pickle contains:
+
+- `best_layer_index`: layer selected from the best validation probe
+- `best_probe`: layer, seed, metric, and score
+- `probes[layer]["weights"]`: shape `(5, hidden_dim)` for the default five seeds
+- `probes[layer]["bias"]`: shape `(5,)`
+- `probes[layer]["threshold"]`: shape `(5,)`
+- `aggregation`: `mean_margin`
+
+The submission should load `best_layer_index`, encode that layer's final
+input-token hidden state, compute all five probe scores, and return
+`mean(scores - threshold) >= 0`.
+
+## Direct Commands
+
+The wrappers call these scripts:
 
 ```bash
-MPLCONFIGDIR=/tmp/mpl python scripts/plot_probe_layer_curves.py \
-  --results-dirs results/eval_adoption_absolute_accuracy_decay_probe_v1 \
-  --target-prefix absolute_accuracy_decay \
-  --metric-set regression \
-  --column-mode origin \
-  --output-dir plots/layer_curves
+python scripts/encode.py --help
+python scripts/probe.py --help
 ```
 
-Probe vs kernel:
-
-```bash
-MPLCONFIGDIR=/tmp/mpl python scripts/compare_probe_kernel.py \
-  --probe-results-dir results/eval_adoption_absolute_accuracy_decay_probe_v1 \
-  --kernel-results-dir results/eval_adoption_absolute_accuracy_decay_kernel_v1 \
-  --target-prefix absolute_accuracy_decay \
-  --output-dir plots/probe_vs_kernel
-```
-
-Method comparison:
-
-```bash
-MPLCONFIGDIR=/tmp/mpl python scripts/plot_method_comparison.py \
-  --results-dirs \
-    results/eval_adoption_absolute_accuracy_decay_probe_v1 \
-    results/eval_adoption_absolute_accuracy_decay_kernel_v1 \
-  --target-prefix absolute_accuracy_decay \
-  --origin input_last_token \
-  --output-dir plots/method_comparison
-```
-
-## License
-
-No standalone license file is currently included in this repository. Confirm licensing before redistribution or external reuse.
-
-## Citation
-
-No citation metadata is currently included in this repository. If you need a formal citation block, add it together with the corresponding paper, report, or project page.
+Use the direct scripts when you need fine-grained options beyond the wrapper
+environment variables.
