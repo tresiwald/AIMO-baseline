@@ -1672,9 +1672,17 @@ def main() -> None:
             f"Target column {args.target_col!r} not found in {internals_dir / 'metadata.csv'}"
         )
     if selected_permutation_types is not None:
-        metadata = metadata[metadata["permutation_type"].isin(selected_permutation_types)].copy()
+        available_permutation_types = sorted(
+            str(value) for value in metadata["permutation_type"].dropna().unique().tolist()
+        )
+        selected_permutation_type_keys = {value.lower() for value in selected_permutation_types}
+        permutation_type_keys = metadata["permutation_type"].astype(str).str.lower()
+        metadata = metadata[permutation_type_keys.isin(selected_permutation_type_keys)].copy()
         if metadata.empty:
-            raise ValueError(f"No rows matched --permutation-types {selected_permutation_types}.")
+            raise ValueError(
+                f"No rows matched --permutation-types {selected_permutation_types}. "
+                f"Available permutation types: {available_permutation_types}"
+            )
     if selected_layers is not None:
         selected_layer_set = set(selected_layers)
         layer_files = [

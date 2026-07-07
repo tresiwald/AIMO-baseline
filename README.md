@@ -69,6 +69,7 @@ bash run_probing.bash
 ```
 
 By default, `run_probing.bash` trains only the `overall` permutation probe.
+Matching is case-insensitive, so this selects `OVERALL` in the released CSV.
 Set `PERMUTATION_TYPES` explicitly to run other permutation groups.
 
 Useful optional limits for quick tests:
