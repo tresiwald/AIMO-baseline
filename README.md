@@ -68,11 +68,14 @@ NUM_WORKERS=1 \
 bash run_probing.bash
 ```
 
+By default, `run_probing.bash` trains only the `overall` permutation probe.
+Set `PERMUTATION_TYPES` explicitly to run other permutation groups.
+
 Useful optional limits for quick tests:
 
 ```bash
 LAYERS=12 \
-PERMUTATION_TYPES=domain \
+PERMUTATION_TYPES=overall \
 CONTROL_TASKS=NONE \
 SEEDS=42,43,44,45,46 \
 NUM_FOLDS=2 \
